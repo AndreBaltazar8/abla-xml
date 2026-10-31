@@ -1,0 +1,300 @@
+// Runs the W3C XML conformance suite against this parser.
+//
+//   conformance <suite dir> <expected failures file> [-v]
+//
+// The suite's own catalogs are read with this parser. Which tests apply, and what
+// passing means, is written down in README.md under Conformance.
+import "../src/xml.ab"
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+import "abla/text"
+import "abla/bytes"
+
+class Tally(
+    var total: int = 0,
+    var passed: int = 0,
+    var failed: int = 0,
+    var unreachable: int = 0,
+    var outOfScope: int = 0,
+    var outputs: int = 0,
+    var outputsPassed: int = 0,
+    // Accepted, though the test also uses external entities this parser never read.
+    var partlyRead: int = 0
+)
+
+class Run(
+    val suite: string,
+    val expected: Map<string, string>,
+    val seen: Map<string, bool>,
+    val tallies: Map<string, Tally>,
+    val order: array<string>,
+    val verbose: bool,
+    val notes: array<string>,
+    var unexpected: int = 0
+)
+
+fun catalogs(): array<string> = [
+    "xmltest/xmltest.xml", "japanese/japanese.xml",
+    "sun/sun-valid.xml", "sun/sun-invalid.xml", "sun/sun-not-wf.xml", "sun/sun-error.xml",
+    "oasis/oasis.xml",
+    "ibm/ibm_oasis_valid.xml", "ibm/ibm_oasis_invalid.xml", "ibm/ibm_oasis_not-wf.xml",
+    "ibm/xml-1.1/ibm_valid.xml", "ibm/xml-1.1/ibm_invalid.xml", "ibm/xml-1.1/ibm_not-wf.xml",
+    "eduni/errata-2e/errata2e.xml", "eduni/errata-3e/errata3e.xml", "eduni/errata-4e/errata4e.xml",
+    "eduni/namespaces/1.0/rmt-ns10.xml", "eduni/namespaces/1.1/rmt-ns11.xml",
+    "eduni/namespaces/errata-1e/errata1e.xml",
+    "eduni/xml-1.1/xml11.xml", "eduni/misc/ht-bh.xml"
+]
+
+fun directoryOf(path: string): string {
+    val slash = path.lastIndexOf("/")
+    if (slash < 0) "" else path.slice(0, slash + 1)
+}
+
+fun inScope(test: XmlElement): bool {
+    val recommendation = test.attributeValue("RECOMMENDATION", "XML1.0")
+    if (recommendation == "XML1.1" || recommendation == "NS1.1") return false
+    val version = test.attributeValue("VERSION", "1.0")
+    if (version.split(" ").indexOfWord("1.0") == false) return false
+    val edition = test.attributeValue("EDITION", "")
+    edition.size == 0 || edition.split(" ").indexOfWord("5")
+}
+
+fun array<string>.indexOfWord(word: string): bool {
+    for (candidate in this) {
+        if (candidate == word) return true
+    }
+    false
+}
+
+// Canonical XML as the suite's OUTPUT files have it (James Clark's form).
+fun canonicalEscape(text: string, inAttribute: bool): string {
+    val out = byteBuffer()
+    for (b in text) {
+        when (b) {
+            38 -> out.appendText("&amp;")
+            60 -> out.appendText("&lt;")
+            62 -> out.appendText("&gt;")
+            34 -> out.appendText("&quot;")
+            9 -> out.appendText("&#9;")
+            10 -> out.appendText("&#10;")
+            13 -> out.appendText("&#13;")
+            else -> out.appendByteValue(b)
+        }
+    }
+    out.toText()
+}
+
+fun canonicalNode(var out: ByteBuffer, node: XmlNode): void {
+    when (node) {
+        is XmlText -> out.appendText(canonicalEscape(node.text, false))
+        is XmlProcessingInstruction -> out.appendText("<?${node.target} ${node.data}?>")
+        is XmlElement -> canonicalElement(out, node)
+        else -> {}
+    }
+    return
+}
+
+fun canonicalElement(var out: ByteBuffer, element: XmlElement): void {
+    val names: array<string> = []
+    val values: array<string> = []
+    for (attribute in element.attributes) {
+        var at = names.size
+        names.append(attribute.name)
+        values.append(attribute.value)
+        while (at > 0 && names[at - 1] > names[at]) {
+            val n = names[at]
+            names[at] = names[at - 1]
+            names[at - 1] = n
+            val v = values[at]
+            values[at] = values[at - 1]
+            values[at - 1] = v
+            at = at - 1
+        }
+    }
+    out.appendText("<${element.name}")
+    var i = 0
+    while (i < names.size) {
+        out.appendText(" ${names[i]}=\"${canonicalEscape(values[i], true)}\"")
+        i = i + 1
+    }
+    out.appendText(">")
+    for (node in element.children) canonicalNode(out, node)
+    out.appendText("</${element.name}>")
+    return
+}
+
+fun canonical(document: XmlDocument): string {
+    val out = byteBuffer()
+    for (node in document.prolog) canonicalNode(out, node)
+    canonicalElement(out, document.root)
+    for (node in document.epilog) canonicalNode(out, node)
+    out.toText()
+}
+
+fun record(var run: Run, id: string, failure: string): void {
+    run.seen.set(id, true)
+    val known = run.expected.get(id)
+    if (known == null) {
+        run.unexpected = run.unexpected + 1
+        run.notes.append("UNEXPECTED FAIL $id: $failure")
+    } else if (run.verbose) {
+        run.notes.append("expected fail $id: $failure  [$known]")
+    }
+    return
+}
+
+fun runTest(var run: Run, catalog: string, group: string, test: XmlElement): void {
+    val type = test.attributeValue("TYPE", "")
+    val id = test.attributeValue("ID", "")
+    val entities = test.attributeValue("ENTITIES", "none")
+    val key = "$group $type"
+    if (!run.tallies.has(key)) {
+        run.tallies.set(key, Tally())
+        run.order.append(key)
+    }
+    val tally = run.tallies.get(key) ?? panic("no tally")
+    tally.total = tally.total + 1
+    if (!inScope(test)) {
+        tally.outOfScope = tally.outOfScope + 1
+        return
+    }
+    val directory = "${run.suite}/${directoryOf(catalog)}"
+    val source = Path("$directory${test.attributeValue("URI", "")}").readTextResult()
+    if (!source.succeeded) {
+        tally.failed = tally.failed + 1
+        record(run, id, "test file can't be read")
+        return
+    }
+    val namespaces = test.attributeValue("NAMESPACE", "yes") != "no"
+    val options = XmlOptions(allowDtd = true, namespaces = namespaces)
+    val result = xmlParse(source.text, options)
+    val problem = result.error
+    var problemText = ""
+    if (problem != null) problemText = "${problem.code} at ${problem.line}:${problem.column}: ${problem.message}"
+    if (type == "not-wf") {
+        if (!result.succeeded) {
+            tally.passed = tally.passed + 1
+            if (run.verbose && problem != null) run.notes.append("rejected ${problem.code} $id")
+        } else if (entities != "none") {
+            // Its error may lie in an external entity, which this parser never reads.
+            tally.unreachable = tally.unreachable + 1
+            if (run.verbose) run.notes.append("external-only ${test.attributeValue("URI", "")} in $directory")
+        } else {
+            tally.failed = tally.failed + 1
+            record(run, id, "accepted")
+        }
+        return
+    }
+    if (type == "error") {
+        // A processor may report these or not; both pass.
+        tally.passed = tally.passed + 1
+        return
+    }
+    if (!result.succeeded) {
+        tally.failed = tally.failed + 1
+        record(run, id, "rejected: $problemText")
+        return
+    }
+    tally.passed = tally.passed + 1
+    if (entities != "none") tally.partlyRead = tally.partlyRead + 1
+    val output = test.attributeValue("OUTPUT", "")
+    val document = result.document
+    if (output.size > 0 && document != null && document.skippedEntities == 0) {
+        val wanted = Path("$directory$output").readTextResult()
+        // A <!DOCTYPE> there is the second canonical form, with notations, which
+        // this comparison doesn't write.
+        if (!wanted.text.contains("<!DOCTYPE") && entities == "none") {
+            tally.outputs = tally.outputs + 1
+            if (canonical(document) == wanted.text) {
+                tally.outputsPassed = tally.outputsPassed + 1
+            } else {
+                record(run, id, "output differs")
+            }
+        }
+    }
+    return
+}
+
+fun runTests(var run: Run, catalog: string, group: string, parent: XmlElement): int {
+    var count = 0
+    for (test in parent.elements()) {
+        if (test.name == "TEST") {
+            count = count + 1
+            runTest(run, catalog, group, test)
+        } else {
+            count = count + runTests(run, catalog, group, test)
+        }
+    }
+    count
+}
+
+fun readExpected(path: string): Map<string, string> {
+    val expected: Map<string, string> = Map()
+    for (line in Path(path).readText().split("\n")) {
+        val trimmed = line.trim()
+        if (trimmed.size > 0 && !trimmed.startsWith("#")) {
+            val space = trimmed.indexOf(" ")
+            if (space < 0) expected.set(trimmed, "") else expected.set(trimmed.slice(0, space), trimmed.slice(space + 1, trimmed.size))
+        }
+    }
+    expected
+}
+
+fun main: int {
+    if (processArgumentCount() < 2) {
+        eprintln("usage: conformance <suite dir> <expected failures file> [-v]")
+        return 2
+    }
+    val run = Run(processArgument(0), readExpected(processArgument(1)), Map(), Map(), [],
+        processArgumentCount() > 2, [])
+    var tests = 0
+    for (catalog in catalogs()) {
+        val text = Path("${run.suite}/$catalog").readText()
+        // Some catalogs are fragments with many roots, meant for inclusion.
+        var parsed = xmlParse(text, XmlOptions(allowDtd = true))
+        if (!parsed.succeeded) {
+            var body = text
+            if (body.startsWith("<?xml")) body = body.slice(body.indexOf("?>") + 2, body.size)
+            parsed = xmlParse("<w>$body</w>", XmlOptions(allowDtd = true))
+        }
+        val document = parsed.document
+        if (document == null) {
+            val problem = parsed.error
+            eprintln("catalog $catalog: ${if (problem != null) problem.message else "unreadable"}")
+            return 2
+        }
+        val slash = catalog.indexOf("/")
+        var group = catalog.slice(0, slash)
+        if (catalog.contains("xml-1.1") || catalog.contains("/1.1/")) group = "$group-1.1"
+        if (catalog.startsWith("eduni")) group = catalog.slice(0, catalog.lastIndexOf("/")).replace("/", "-")
+        if (catalog.startsWith("ibm/xml-1.1")) group = "ibm-1.1"
+        tests = tests + runTests(run, catalog, group, document.root)
+    }
+    println("| group type | tests | out of scope | passed | failed | external only | output checks | passed, externals unread |")
+    println("|---|---:|---:|---:|---:|---:|---:|---:|")
+    val sum = Tally()
+    for (key in run.order) {
+        val t = run.tallies.get(key) ?? panic("no tally")
+        println("| $key | ${t.total} | ${t.outOfScope} | ${t.passed} | ${t.failed} | ${t.unreachable} | ${t.outputsPassed}/${t.outputs} | ${t.partlyRead} |")
+        sum.total = sum.total + t.total
+        sum.outOfScope = sum.outOfScope + t.outOfScope
+        sum.passed = sum.passed + t.passed
+        sum.failed = sum.failed + t.failed
+        sum.unreachable = sum.unreachable + t.unreachable
+        sum.outputs = sum.outputs + t.outputs
+        sum.outputsPassed = sum.outputsPassed + t.outputsPassed
+        sum.partlyRead = sum.partlyRead + t.partlyRead
+    }
+    println("| **all** | ${sum.total} | ${sum.outOfScope} | ${sum.passed} | ${sum.failed} | ${sum.unreachable} | ${sum.outputsPassed}/${sum.outputs} | ${sum.partlyRead} |")
+    for (note in run.notes) println(note)
+    var stale = 0
+    for (id in run.expected.keys()) {
+        if (!run.seen.has(id)) {
+            println("STALE expected failure: $id")
+            stale = stale + 1
+        }
+    }
+    println("$tests tests in catalogs, ${run.unexpected} unexpected failures, $stale stale entries")
+    if (run.unexpected > 0 || stale > 0) 1 else 0
+}

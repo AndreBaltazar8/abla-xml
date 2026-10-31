@@ -1,0 +1,2 @@
+# Conformance tests known to fail: <test ID> <reason>. Empty means none. The run
+# fails on any failure not listed here, and on any entry that no longer fails.
