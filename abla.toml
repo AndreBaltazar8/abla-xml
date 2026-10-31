@@ -1,0 +1,3 @@
+name = "abla-xml"
+version = "0.1.0"
+entry = "src/xml.ab"

@@ -1,0 +1,5 @@
+import "chars.ab"
+import "encoding.ab"
+import "writer.ab"
+
+fun xmlPackageVersion(): string = "0.1.0"

@@ -1,0 +1,213 @@
+// Encodings. Everything inside the library is UTF-8; these convert at the edges.
+import "abla/bytes"
+import "abla/text"
+import "chars.ab"
+
+val xmlEncodingUtf8 = 0
+val xmlEncodingAscii = 1
+val xmlEncodingLatin1 = 2
+val xmlEncodingWindows1252 = 3
+val xmlEncodingUtf16 = 4
+val xmlEncodingUnknown = -1
+
+// The encoding a declared name means, ignoring case (names are from the IANA
+// registry, with their common aliases).
+fun xmlEncodingFromName(name: string): int {
+    val folded = name.uppercase()
+    when (folded) {
+        "UTF-8", "UTF8" -> xmlEncodingUtf8
+        "US-ASCII", "ASCII" -> xmlEncodingAscii
+        "ISO-8859-1", "ISO_8859-1", "LATIN1", "LATIN-1" -> xmlEncodingLatin1
+        "WINDOWS-1252", "CP1252" -> xmlEncodingWindows1252
+        "UTF-16" -> xmlEncodingUtf16
+        else -> xmlEncodingUnknown
+    }
+}
+
+// [81] EncName
+fun xmlEncodingNameValid(name: string): bool {
+    if (name.size == 0) return false
+    val first = name[0]
+    if (!((first >= 97 && first <= 122) || (first >= 65 && first <= 90))) return false
+    var i = 1
+    while (i < name.size) {
+        val b = name[i]
+        if (!((b >= 97 && b <= 122) || (b >= 65 && b <= 90) || (b >= 48 && b <= 57) ||
+            b == 46 || b == 95 || b == 45)) return false
+        i = i + 1
+    }
+    true
+}
+
+// Windows-1252 bytes 0x80 to 0x9F. A 0 is a byte the code page leaves undefined.
+private fun xmlWindows1252High(byte: int): int = when (byte) {
+    0x80 -> 0x20AC
+    0x82 -> 0x201A
+    0x83 -> 0x0192
+    0x84 -> 0x201E
+    0x85 -> 0x2026
+    0x86 -> 0x2020
+    0x87 -> 0x2021
+    0x88 -> 0x02C6
+    0x89 -> 0x2030
+    0x8A -> 0x0160
+    0x8B -> 0x2039
+    0x8C -> 0x0152
+    0x8E -> 0x017D
+    0x91 -> 0x2018
+    0x92 -> 0x2019
+    0x93 -> 0x201C
+    0x94 -> 0x201D
+    0x95 -> 0x2022
+    0x96 -> 0x2013
+    0x97 -> 0x2014
+    0x98 -> 0x02DC
+    0x99 -> 0x2122
+    0x9A -> 0x0161
+    0x9B -> 0x203A
+    0x9C -> 0x0153
+    0x9E -> 0x017E
+    0x9F -> 0x0178
+    else -> 0
+}
+
+// The byte encoding a code point in a single-byte encoding, or -1 when the
+// encoding can't represent it.
+fun xmlEncodeSingleByte(cp: int, encoding: int): int {
+    if (cp < 0x80) return cp
+    if (encoding == xmlEncodingLatin1) return if (cp <= 0xFF) cp else -1
+    if (encoding == xmlEncodingWindows1252) {
+        if (cp >= 0xA0 && cp <= 0xFF) return cp
+        var byte = 0x80
+        while (byte <= 0x9F) {
+            if (xmlWindows1252High(byte) == cp) return byte
+            byte = byte + 1
+        }
+    }
+    -1
+}
+
+class XmlDecoded(
+    val text: string,
+    val errorCode: string,
+    val errorOffset: int,
+    // How many bytes before `text` the source has: a skipped byte order mark.
+    val bias: int
+)
+
+private fun xmlDecodeSingleByte(source: string, encoding: int): XmlDecoded {
+    var i = 0
+    while (i < source.size && source[i] < 0x80) i = i + 1
+    if (i == source.size) return XmlDecoded(source, "", 0, 0)
+    if (encoding == xmlEncodingAscii) {
+        return XmlDecoded("", "invalid_encoding", i, 0)
+    }
+    val out = byteBuffer()
+    out.appendText(source.slice(0, i))
+    while (i < source.size) {
+        val b = source[i]
+        if (b < 0x80) {
+            out.appendByteValue(b)
+        } else if (encoding == xmlEncodingWindows1252 && b <= 0x9F) {
+            val cp = xmlWindows1252High(b)
+            if (cp == 0) return XmlDecoded("", "invalid_encoding", i, 0)
+            out.appendText(utf8Encode(cp))
+        } else {
+            out.appendByteValue(0xC0 | (b >> 6))
+            out.appendByteValue(0x80 | (b & 0x3F))
+        }
+        i = i + 1
+    }
+    XmlDecoded(out.toText(), "", 0, 0)
+}
+
+private fun xmlDecodeUtf16(source: string, bigEndian: bool): XmlDecoded {
+    val high = if (bigEndian) 0 else 1
+    val low = 1 - high
+    val out = byteBuffer()
+    var i = 2
+    if (source.size % 2 != 0) {
+        return XmlDecoded("", "invalid_encoding", source.size - 1, 0)
+    }
+    while (i < source.size) {
+        val unit = (source[i + high] << 8) | source[i + low]
+        i = i + 2
+        var cp = unit
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            if (i >= source.size) {
+                return XmlDecoded("", "invalid_encoding", i - 2, 0)
+            }
+            val next = (source[i + high] << 8) | source[i + low]
+            if (next < 0xDC00 || next > 0xDFFF) {
+                return XmlDecoded("", "invalid_encoding", i - 2, 0)
+            }
+            cp = 0x10000 + ((unit - 0xD800) << 10) + (next - 0xDC00)
+            i = i + 2
+        } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            return XmlDecoded("", "invalid_encoding", i - 2, 0)
+        }
+        if (cp < 0x80) {
+            out.appendByteValue(cp)
+        } else {
+            out.appendText(utf8Encode(cp))
+        }
+    }
+    XmlDecoded(out.toText(), "", 0, 0)
+}
+
+// The value of the encoding pseudo-attribute of an XML declaration at the start
+// of ASCII-compatible text, or "" when there is none. The declaration's grammar
+// is checked later, by the parser, on the decoded text.
+private fun xmlSniffDeclaredEncoding(source: string): string {
+    if (!source.startsWith("<?xml") || source.size < 6 ||
+        !xmlIsSpace(source[5])) return ""
+    val close = source.indexOf("?>")
+    if (close < 0) return ""
+    val at = source.slice(0, close).indexOf("encoding")
+    if (at < 0) return ""
+    var i = at + 8
+    while (i < close && xmlIsSpace(source[i])) i = i + 1
+    if (i >= close || source[i] != 61) return ""
+    i = i + 1
+    while (i < close && xmlIsSpace(source[i])) i = i + 1
+    if (i >= close || (source[i] != 34 && source[i] != 39)) return ""
+    val end = source.indexOf(if (source[i] == 34) "\"" else "'", i + 1)
+    if (end < 0 || end > close) return ""
+    source.slice(i + 1, end)
+}
+
+// Decodes a document's bytes to UTF-8 per XML 1.0 section 4.3.3 and appendix F:
+// a byte order mark decides first, then the XML declaration, then UTF-8.
+fun xmlDecodeSource(source: string): XmlDecoded {
+    if (source.size >= 2 && ((source[0] == 0xFF && source[1] == 0xFE) ||
+        (source[0] == 0xFE && source[1] == 0xFF))) {
+        val decoded = xmlDecodeUtf16(source, source[0] == 0xFE)
+        if (decoded.errorCode.size > 0) return decoded
+        val declared = xmlSniffDeclaredEncoding(decoded.text)
+        if (declared.size > 0 && xmlEncodingFromName(declared) != xmlEncodingUtf16) {
+            return XmlDecoded("", "encoding_mismatch", 0, 0)
+        }
+        return decoded
+    }
+    var bias = 0
+    var body = source
+    if (source.size >= 3 && source[0] == 0xEF && source[1] == 0xBB &&
+        source[2] == 0xBF) {
+        bias = 3
+        body = source.slice(3, source.size)
+    }
+    val declared = xmlSniffDeclaredEncoding(body)
+    // A malformed name is the parser's to report, as a malformed declaration.
+    if (declared.size == 0 || !xmlEncodingNameValid(declared)) return XmlDecoded(body, "", 0, bias)
+    val encoding = xmlEncodingFromName(declared)
+    if (encoding == xmlEncodingUnknown) {
+        return XmlDecoded("", "unsupported_encoding", 0, bias)
+    }
+    // UTF-16 needs a byte order mark, and a UTF-8 mark rules everything else out.
+    if (encoding == xmlEncodingUtf16 ||
+        (bias > 0 && encoding != xmlEncodingUtf8)) {
+        return XmlDecoded("", "encoding_mismatch", 0, bias)
+    }
+    if (encoding == xmlEncodingUtf8) return XmlDecoded(body, "", 0, bias)
+    xmlDecodeSingleByte(body, encoding)
+}

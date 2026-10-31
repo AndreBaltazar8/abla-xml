@@ -1,0 +1,473 @@
+// A deterministic XML writer: the same calls always give the same bytes.
+//
+// Nothing is reordered: attributes and namespace declarations come out in the
+// order they were written, children likewise. The writer makes no prefixes up;
+// names are written as given, and each prefix must have been declared.
+import "abla/bytes"
+import "abla/text"
+import "chars.ab"
+import "encoding.ab"
+
+class XmlWriterOptions(
+    // UTF-8, US-ASCII, ISO-8859-1 or windows-1252; the XML declaration spells
+    // it as given here. Characters the encoding lacks become character
+    // references in text and attribute values, and an error anywhere else.
+    val encoding: string = "UTF-8",
+    // One level of indentation; "" writes no whitespace at all. An element
+    // holding text keeps its content on one line, so indenting never changes
+    // what a text node contains.
+    val indent: string = ""
+)
+
+class XmlWriteResult(
+    val succeeded: bool,
+    val text: string,
+    val errorCode: string,
+    val errorMessage: string
+)
+
+class XmlWriter(
+    val encodingName: string,
+    val encoding: int,
+    val indent: string,
+    val out: ByteBuffer,
+    val names: array<string>,
+    val hasText: array<bool>,
+    val hasChild: array<bool>,
+    val nsPrefixes: array<string>,
+    val nsUris: array<string>,
+    val nsMarks: array<int>,
+    val pendingNames: array<string>,
+    val pendingValues: array<string>,
+    var tagOpen: bool = false,
+    var rootSeen: bool = false,
+    var written: bool = false,
+    var finished: bool = false,
+    var errorCode: string = "",
+    var errorMessage: string = ""
+) {
+    fun failed(): bool = errorCode.size > 0
+
+    // Writes the XML declaration, which must come first. `standalone` is "",
+    // "yes" or "no".
+    fun declaration(standalone: string = ""): void {
+        if (!ready()) return
+        if (written) {
+            fail("misplaced_declaration", "the XML declaration must come first")
+            return
+        }
+        if (standalone != "" && standalone != "yes" && standalone != "no") {
+            fail("invalid_standalone", "standalone must be yes or no")
+            return
+        }
+        out.appendText("<?xml version=\"1.0\" encoding=\"$encodingName\"")
+        if (standalone.size > 0) out.appendText(" standalone=\"$standalone\"")
+        out.appendText("?>\n")
+        written = true
+        return
+    }
+
+    // Opens an element. `name` is a QName; its prefix may be declared by a
+    // namespace() call that follows, before anything else goes in the element.
+    fun startElement(name: string): void {
+        if (!ready() || !closeTag()) return
+        if (!xmlIsQName(name)) {
+            fail("invalid_name", "invalid element name")
+            return
+        }
+        if (names.size == 0) {
+            if (rootSeen) {
+                fail("multiple_roots", "a document has one root element")
+                return
+            }
+            rootSeen = true
+        }
+        beforeMarkup()
+        out.appendText("<")
+        if (!raw(name)) return
+        names.append(name)
+        hasText.append(false)
+        hasChild.append(false)
+        nsMarks.append(nsPrefixes.size)
+        written = true
+        tagOpen = true
+        return
+    }
+
+    // Declares a prefix ("" for the default namespace) on the element just
+    // opened.
+    fun namespace(prefix: string, uri: string): void {
+        if (!ready()) return
+        if (!tagOpen) {
+            fail("misplaced_attribute", "namespace declarations go right after startElement")
+            return
+        }
+        if (prefix.size > 0 && !xmlIsNcName(prefix)) {
+            fail("invalid_name", "invalid namespace prefix")
+            return
+        }
+        val problem = xmlNamespaceDeclarationError(prefix, uri)
+        if (problem.size > 0) {
+            fail(problem, "namespace declaration not allowed")
+            return
+        }
+        if (!checkText(uri)) return
+        nsPrefixes.append(prefix)
+        nsUris.append(uri)
+        pendingNames.append(if (prefix.size > 0) "xmlns:$prefix" else "xmlns")
+        pendingValues.append(uri)
+        return
+    }
+
+    // Adds an attribute to the element just opened. `name` is a QName; use
+    // namespace() for xmlns declarations.
+    fun attribute(name: string, value: string): void {
+        if (!ready()) return
+        if (!tagOpen) {
+            fail("misplaced_attribute", "attributes go right after startElement")
+            return
+        }
+        if (!xmlIsQName(name)) {
+            fail("invalid_name", "invalid attribute name")
+            return
+        }
+        if (name == "xmlns" || name.startsWith("xmlns:")) {
+            fail("misplaced_namespace", "declare namespaces with namespace()")
+            return
+        }
+        if (!checkText(value)) return
+        pendingNames.append(name)
+        pendingValues.append(value)
+        return
+    }
+
+    // Adds escaped character data to the open element.
+    fun text(value: string): void {
+        if (value.size == 0 || !ready() || !closeTag()) return
+        if (names.size == 0) {
+            fail("text_outside_root", "text must be inside the root element")
+            return
+        }
+        if (!checkText(value)) return
+        hasText[hasText.size - 1] = true
+        escape(value, false)
+        return
+    }
+
+    // Adds a CDATA section to the open element. A "]]>" in the value is split
+    // across two sections, and a carriage return, which a section can't keep, is
+    // a reference between two, so any text can be written.
+    fun cdata(value: string): void {
+        if (!ready() || !closeTag()) return
+        if (names.size == 0) {
+            fail("text_outside_root", "text must be inside the root element")
+            return
+        }
+        if (!checkText(value)) return
+        hasText[hasText.size - 1] = true
+        val body = value.replace("]]>", "]]]]><![CDATA[>").replace("\r", "]]>&#xD;<![CDATA[")
+        if (!raw("<![CDATA[$body]]>")) return
+        return
+    }
+
+    // A carriage return in a comment or an instruction reads back as a line feed.
+    fun comment(value: string): void {
+        if (!ready() || !closeTag()) return
+        if (!checkText(value)) return
+        if (value.contains("--") || value.endsWith("-")) {
+            fail("invalid_comment", "a comment can't contain -- or end with -")
+            return
+        }
+        beforeMarkup()
+        if (!raw("<!--$value-->")) return
+        written = true
+        return
+    }
+
+    fun processingInstruction(target: string, data: string = ""): void {
+        if (!ready() || !closeTag()) return
+        if (!xmlIsNcName(target) || target.lowercase() == "xml") {
+            fail("invalid_name", "invalid processing instruction target")
+            return
+        }
+        if (!checkText(data)) return
+        if (data.contains("?>")) {
+            fail("invalid_processing_instruction", "data can't contain ?>")
+            return
+        }
+        beforeMarkup()
+        if (!raw(if (data.size > 0) "<?$target $data?>" else "<?$target?>")) return
+        written = true
+        return
+    }
+
+    // Closes the innermost open element.
+    fun endElement(): void {
+        if (!ready()) return
+        if (names.size == 0) {
+            fail("unbalanced", "no element is open")
+            return
+        }
+        val wasOpen = tagOpen
+        if (!writePending("/>")) return
+        val top = names.size - 1
+        val name = names[top]
+        if (!wasOpen) {
+            if (indent.size > 0 && hasChild[top] && !hasText[top]) {
+                newline(top)
+            }
+            out.appendText("</")
+            if (!raw(name)) return
+            out.appendText(">")
+        }
+        names.truncate(top)
+        hasText.truncate(top)
+        hasChild.truncate(top)
+        nsPrefixes.truncate(nsMarks[top])
+        nsUris.truncate(nsMarks[top])
+        nsMarks.truncate(top)
+        return
+    }
+
+    // <name>value</name>, or <name/> when the value is empty.
+    fun element(name: string, value: string = ""): void {
+        startElement(name)
+        text(value)
+        endElement()
+        return
+    }
+
+    // Ends the document and gives its bytes, or the first error. Nothing is
+    // written after an error, and the text is then empty.
+    fun finish(): XmlWriteResult {
+        if (!failed() && names.size > 0) fail("unbalanced", "element ${names[names.size - 1]} is still open")
+        if (!failed() && !rootSeen) fail("no_root", "a document needs a root element")
+        if (failed()) return XmlWriteResult(false, "", errorCode, errorMessage)
+        if (indent.size > 0 && !finished) out.appendText("\n")
+        finished = true
+        XmlWriteResult(true, out.toText(), "", "")
+    }
+
+    fun fail(code: string, message: string): void {
+        if (errorCode.size == 0) {
+            errorCode = code
+            errorMessage = message
+        }
+        return
+    }
+
+    fun ready(): bool {
+        if (failed()) return false
+        if (finished) {
+            fail("finished", "the document is finished")
+            return false
+        }
+        true
+    }
+
+    fun checkText(value: string): bool {
+        if (xmlFirstInvalidChar(value) >= 0) {
+            fail("invalid_char", "text has invalid UTF-8 or a character XML forbids")
+            return false
+        }
+        true
+    }
+
+    fun newline(depth: int): void {
+        out.appendText("\n")
+        var i = 0
+        while (i < depth) {
+            out.appendText(indent)
+            i = i + 1
+        }
+        return
+    }
+
+    // Keeps the layout: a markup child on its own line unless text is around.
+    fun beforeMarkup(): void {
+        val depth = names.size
+        if (depth > 0) {
+            val top = depth - 1
+            hasChild[top] = true
+            if (indent.size > 0 && !hasText[top]) newline(depth)
+        } else if (indent.size > 0 && written && !lastWasDeclaration()) {
+            out.appendText("\n")
+        }
+        return
+    }
+
+    fun lastWasDeclaration(): bool {
+        val size = out.size()
+        size > 0 && out.byteAt(size - 1) == 10
+    }
+
+    fun closeTag(): bool = writePending(">")
+
+    // Finishes an open start tag: checks it as a whole, then writes it.
+    fun writePending(close: string): bool {
+        if (!tagOpen) return true
+        tagOpen = false
+        val name = names[names.size - 1]
+        val prefix = xmlPrefixOf(name)
+        if (prefix.size > 0 && !prefixKnown(prefix)) {
+            fail("undeclared_prefix", "prefix $prefix is not declared")
+            return false
+        }
+        if (xmlHasDuplicate(pendingNames)) {
+            fail("duplicate_attribute", "an attribute is written twice on $name")
+            return false
+        }
+        val expanded: array<string> = []
+        for (qname in pendingNames) {
+            val attributePrefix = xmlPrefixOf(qname)
+            if (qname == "xmlns" || attributePrefix == "xmlns") continue
+            if (attributePrefix.size == 0) {
+                expanded.append("{}$qname")
+            } else {
+                if (!prefixKnown(attributePrefix)) {
+                    fail("undeclared_prefix", "prefix $attributePrefix is not declared")
+                    return false
+                }
+                expanded.append("{${prefixUri(attributePrefix)}}${xmlLocalOf(qname)}")
+            }
+        }
+        if (xmlHasDuplicate(expanded)) {
+            fail("duplicate_attribute", "two attributes on $name have one expanded name")
+            return false
+        }
+        var i = 0
+        while (i < pendingNames.size) {
+            out.appendText(" ")
+            if (!raw(pendingNames[i])) return false
+            out.appendText("=\"")
+            escape(pendingValues[i], true)
+            out.appendText("\"")
+            i = i + 1
+        }
+        pendingNames.clear()
+        pendingValues.clear()
+        out.appendText(close)
+        true
+    }
+
+    fun prefixKnown(prefix: string): bool = prefix == "xml" || findPrefix(prefix) >= 0
+
+    fun prefixUri(prefix: string): string {
+        if (prefix == "xml") return xmlNamespaceXml
+        val at = findPrefix(prefix)
+        if (at >= 0) nsUris[at] else ""
+    }
+
+    fun findPrefix(prefix: string): int {
+        var i = nsPrefixes.size - 1
+        while (i >= 0) {
+            if (nsPrefixes[i] == prefix) return i
+            i = i - 1
+        }
+        -1
+    }
+
+    // Writes markup that can't hold a character reference. Text in the
+    // document's encoding, or an error when a character doesn't exist there.
+    fun raw(value: string): bool {
+        if (encoding == xmlEncodingUtf8) {
+            out.appendText(value)
+            return true
+        }
+        var i = 0
+        while (i < value.size) {
+            val b = value[i]
+            if (b < 0x80) {
+                out.appendByteValue(b)
+                i = i + 1
+            } else {
+                val byte = xmlEncodeSingleByte(xmlCodePointAt(value, i), encoding)
+                if (byte < 0) {
+                    fail("unencodable_char", "a name, comment or CDATA section has a character $encodingName lacks")
+                    return false
+                }
+                out.appendByteValue(byte)
+                i = i + xmlUtf8Size(b)
+            }
+        }
+        true
+    }
+
+    // Writes valid text with the markup characters escaped. ">" always is, so
+    // "]]>" can't appear; a carriage return, and in attributes all whitespace
+    // but the space, is a reference so that parsing gives the same value back.
+    fun escape(value: string, inAttribute: bool): void {
+        var run = 0
+        var i = 0
+        val size = value.size
+        while (i < size) {
+            val b = value[i]
+            if (b >= 0x80) {
+                if (encoding == xmlEncodingUtf8) {
+                    i = i + 1
+                } else {
+                    if (i > run) out.appendText(value.slice(run, i))
+                    val cp = xmlCodePointAt(value, i)
+                    val byte = xmlEncodeSingleByte(cp, encoding)
+                    if (byte >= 0) {
+                        out.appendByteValue(byte)
+                    } else {
+                        out.appendText("&#x${xmlHex(cp)};")
+                    }
+                    i = i + xmlUtf8Size(b)
+                    run = i
+                }
+            } else {
+                val replacement = when (b) {
+                    38 -> "&amp;"
+                    60 -> "&lt;"
+                    62 -> "&gt;"
+                    13 -> "&#xD;"
+                    34 -> if (inAttribute) "&quot;" else ""
+                    9 -> if (inAttribute) "&#x9;" else ""
+                    10 -> if (inAttribute) "&#xA;" else ""
+                    else -> ""
+                }
+                if (replacement.size > 0) {
+                    if (i > run) out.appendText(value.slice(run, i))
+                    out.appendText(replacement)
+                    run = i + 1
+                }
+                i = i + 1
+            }
+        }
+        if (size > run) {
+            out.appendText(if (run == 0) value else value.slice(run, size))
+        }
+        return
+    }
+}
+
+fun xmlHex(value: int): string {
+    val digits = "0123456789ABCDEF"
+    var rest = value
+    var result = ""
+    while (rest > 0) {
+        result = digits.slice(rest & 15, (rest & 15) + 1) + result
+        rest = rest >> 4
+    }
+    if (result.size == 0) "0" else result
+}
+
+fun xmlWriter(options: XmlWriterOptions = XmlWriterOptions()): XmlWriter {
+    val encoding = xmlEncodingFromName(options.encoding)
+    val writer = XmlWriter(
+        options.encoding, encoding, options.indent, byteBuffer(),
+        [], [], [], [], [], [], [], []
+    )
+    if (encoding == xmlEncodingUnknown || encoding == xmlEncodingUtf16) {
+        writer.fail("unsupported_encoding", "can't write ${options.encoding}")
+    }
+    var i = 0
+    while (i < options.indent.size) {
+        val b = options.indent[i]
+        if (b != 32 && b != 9) writer.fail("invalid_indent", "indent must be spaces or tabs")
+        i = i + 1
+    }
+    writer
+}
