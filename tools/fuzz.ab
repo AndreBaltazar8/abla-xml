@@ -1,0 +1,144 @@
+// Mutational fuzzing of the parser, with a repeatable random sequence:
+//
+//   fuzz <iterations> <seed> [seed corpus directory] [dump directory]
+//
+// A crash is a panic, which ends the process with its message; the iteration and
+// input are in build/fuzz-current.xml first when tracing. Every input must either
+// parse or give an error with a position inside it. Whatever parses must survive
+// writing the tree and parsing it again with the same meaning. With a dump
+// directory every 8th input is saved with its verdict without namespace rules, for
+// comparing with xmllint.
+import "../src/xml.ab"
+import "../tests/support/generate.ab"
+import "abla/bytes"
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+import "abla/text"
+
+class Stats(var accepted: int = 0, var rejected: int = 0, var rewrites: int = 0, val codes: Map<string, int>)
+
+fun parseCount(text: string): int {
+    var value = 0
+    for (b in text) value = value * 10 + (b - 48)
+    value
+}
+
+fun builtInSeeds(): array<string> = [
+    "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"no\"?>\n<!-- c --><?p d?><r xmlns=\"urn:a\" xmlns:p=\"urn:b\" a=\"1\" p:b=\"&lt;&#65;&#x42;\">t<p:c/>café<![CDATA[<x>]]><!--n--><?q r?>&amp;</r>\n",
+    "<!DOCTYPE d [\n<!ELEMENT d (a|b)*><!ELEMENT a (#PCDATA|b)*><!ELEMENT b EMPTY>\n<!ATTLIST d x CDATA 'dv' y NMTOKENS #IMPLIED z (u|v) 'u' w NOTATION (n) #IMPLIED>\n<!NOTATION n SYSTEM 'n'>\n<!NOTATION m PUBLIC 'pub'>\n<!ENTITY e 'text&f;'>\n<!ENTITY f '<a>&#38;#60;</a>'>\n<!ENTITY % p '<!ENTITY g \"gg\">'>\n%p;\n<!ENTITY ext SYSTEM 'x.xml'>\n<!ENTITY un SYSTEM 'y' NDATA n>\n<!-- c --><?pi x?>\n]>\n<d y=' a  b '>&e;&g;&ext;<b/></d>",
+    "<?xml version='1.0' encoding='windows-1252'?><a b='\xE9\x80'>\xE9</a>",
+    "\xFF\xFE<\x00a\x00>\x00\xE9\x00<\x00/\x00a\x00>\x00",
+    "\xEF\xBB\xBF<a>\u{1F600}</a>",
+    "<!DOCTYPE a [<!ENTITY a0 'xx'><!ENTITY a1 '&a0;&a0;&a0;&a0;'><!ENTITY a2 '&a1;&a1;&a1;&a1;'><!ENTITY a3 '&a2;&a2;&a2;&a2;'>]><a b='&a3;'>&a3;&a3;</a>"
+]
+
+fun dictionary(): array<string> = [
+    "<", ">", "&", ";", "\"", "'", "/", "=", "?", "!", "[", "]", "%", "-", "--", "]]>", "<![CDATA[", "<!--", "-->", "<?", "?>",
+    "</", "/>", "<!DOCTYPE a [", "]>", "<!ENTITY ", "<!ATTLIST ", "<!ELEMENT ", "<!NOTATION ", "SYSTEM ", "PUBLIC ", "NDATA ",
+    "xmlns", "xmlns:", "xml:", ":", "&#", "&#x", "&lt;", "&e;", "%p;", "#PCDATA", "#FIXED ", "(", ")", "|", ",", "*", "+",
+    "\r", "\n", "\t", " ", "\x00", "\x80", "\xC0", "\xED\xA0\x80", "\xEF\xBF\xBE", "\xF4\x90\x80\x80", "\xFF\xFE", "\xFE\xFF", "\xEF\xBB\xBF",
+    "<?xml version='1.0'?>", "encoding='UTF-16'", "encoding='nope'", "standalone='yes'"
+]
+
+fun mutate(var random: Random, source: string, seeds: array<string>, words: array<string>): string {
+    var text = source
+    var count = 1 + random.below(4)
+    while (count > 0) {
+        val at = if (text.size > 0) random.below(text.size + 1) else 0
+        val end = if (text.size > at) at + 1 + random.below(if (text.size - at < 16) text.size - at else 16) else at
+        when (random.below(8)) {
+            0 -> text = text.slice(0, at) + text.slice(end, text.size)
+            1 -> text = text.slice(0, at) + words[random.below(words.size)] + text.slice(at, text.size)
+            2 -> text = text.slice(0, at) + words[random.below(words.size)] + text.slice(end, text.size)
+            3 -> text = text.slice(0, at) + byteEncode(random.below(256)) + text.slice(end, text.size)
+            4 -> if (at < text.size) {
+                text = text.slice(0, at) + byteEncode(text[at] ^ (1 << random.below(8))) + text.slice(at + 1, text.size)
+            }
+            5 -> text = text.slice(0, at) + text.slice(at, end) + text.slice(at, text.size)
+            6 -> {
+                val other = seeds[random.below(seeds.size)]
+                val cut = if (other.size > 0) random.below(other.size) else 0
+                text = text.slice(0, at) + other.slice(cut, other.size)
+            }
+            else -> text = text.slice(0, at)
+        }
+        count = count - 1
+    }
+    text
+}
+
+fun check(source: string, options: XmlOptions, var stats: Stats): bool {
+    val result = xmlParse(source, options)
+    val problem = result.error
+    val document = result.document
+    if (result.succeeded) {
+        stats.accepted = stats.accepted + 1
+        if (document == null) panic("success without a document")
+        if (document.skippedEntities > 0 || !options.namespaces) return true
+        val writer = xmlWriter()
+        xmlWriteDocument(writer, document)
+        val written = writer.finish()
+        if (!written.succeeded) {
+            // Only the comments and instructions of a parsed document can be
+            // unwritable, never its elements or text.
+            panic("a parsed tree doesn't write: ${written.errorCode} ${written.errorMessage}")
+        }
+        val again = xmlParse(written.text, XmlOptions(namespaces = options.namespaces))
+        val reread = again.document
+        if (reread == null) panic("written output does not parse")
+        if (describeTree(reread.root) != describeTree(document.root)) panic("written output means something else")
+        stats.rewrites = stats.rewrites + 1
+    } else {
+        stats.rejected = stats.rejected + 1
+        if (problem == null) panic("failure without an error")
+        if (problem.line < 1 || problem.column < 1 || problem.byteOffset < 0 ||
+            problem.byteOffset > source.size * 2 + 16) {
+            panic("bad error position ${problem.byteOffset} ${problem.line}:${problem.column} for ${problem.code}")
+        }
+        val seen = stats.codes.get(problem.code) ?? 0
+        stats.codes.set(problem.code, seen + 1)
+    }
+    result.succeeded
+}
+
+fun main: int {
+    val iterations = parseCount(processArgument(0))
+    val random = randomFrom(parseCount(processArgument(1)))
+    val seeds = builtInSeeds()
+    if (processArgumentCount() > 2 && processArgument(2).size > 0) {
+        val listing = Path(processArgument(2)).readText()
+        for (line in listing.split("\n")) {
+            if (line.size > 0) {
+                val text = Path(line).readText()
+                if (text.size > 0 && text.size < 16384) seeds.append(text)
+            }
+        }
+    }
+    val dump = if (processArgumentCount() > 3) processArgument(3) else ""
+    if (dump.size > 0) Path(dump).createDirectories()
+    val words = dictionary()
+    val stats = Stats(codes = Map())
+    val verdicts = byteBuffer()
+    val withDtd = XmlOptions(allowDtd = true, maxEntityBytes = 65536)
+    val withoutNamespaces = XmlOptions(allowDtd = true, namespaces = false, maxEntityBytes = 65536)
+    val tight = XmlOptions(maxDepth = 8, maxNodes = 64, maxAttributes = 4, maxNameBytes = 16, maxValueBytes = 64)
+    var i = 0
+    while (i < iterations) {
+        val source = mutate(random, seeds[random.below(seeds.size)], seeds, words)
+        Path("build/fuzz-current.xml").writeText(source)
+        check(source, withDtd, stats)
+        val accepted = check(source, withoutNamespaces, stats)
+        check(source, tight, stats)
+        check(source, XmlOptions(), stats)
+        if (dump.size > 0 && i % 8 == 0) {
+            Path("$dump/$i.xml").writeText(source)
+            verdicts.appendText("$i ${if (accepted) "accept" else "reject"}\n")
+        }
+        i = i + 1
+    }
+    if (dump.size > 0) Path("$dump/verdicts.txt").writeText(verdicts.toText())
+    println("$iterations inputs: ${stats.accepted} parses accepted, ${stats.rejected} rejected, ${stats.rewrites} rewritten and reread")
+    for (code in stats.codes.keys()) println("  $code: ${stats.codes.get(code) ?? 0}")
+    0
+}
