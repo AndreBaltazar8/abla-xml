@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: AndreBaltazar8/setup-abla@b21e1290aa49862e7bf187dc84b6b3511f4b571e # v1.0.0
+        with:
+          version: '0.2.25'
+      - name: Install xmllint
+        run: sudo apt-get update && sudo apt-get install -y libxml2-utils
+      - name: Unit and property tests
+        run: make unit COMPILER=ablac
+      - name: W3C conformance suite
+        run: make conformance COMPILER=ablac
+      - name: Written documents against xmllint and expat
+        run: make written COMPILER=ablac
+      - name: Fuzzing
+        run: make fuzz COMPILER=ablac
