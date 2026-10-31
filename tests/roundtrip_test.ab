@@ -1,0 +1,40 @@
+// Property: what the writer wrote, the parser reads back, for generated documents.
+import "../src/xml.ab"
+import "support/generate.ab"
+import "abla/test"
+
+fun main: int {
+    var seed = 1
+    while (seed <= 2000) {
+        val generated = generateDocument(seed)
+        if (!expect(generated.result.succeeded, "seed $seed writes: ${generated.result.errorCode} ${generated.result.errorMessage}")) return testsPassed()
+        val parsed = xmlParse(generated.result.text)
+        val problem = parsed.error
+        if (problem != null) {
+            expect(false, "seed $seed parses: ${problem.code} ${problem.message} at ${problem.line}:${problem.column}")
+            return testsPassed()
+        }
+        val document = parsed.document
+        if (document != null) {
+            if (!expectEqual(describeTree(document.root), generated.expected, "seed $seed reads back")) return testsPassed()
+            // Writing the tree again gives the same bytes when it holds the same text nodes:
+            // and always means the same.
+            val again = xmlWriter()
+            xmlWriteDocument(again, document)
+            val rewritten = again.finish()
+            expect(rewritten.succeeded, "seed $seed rewrites")
+            val reparsed = xmlParse(rewritten.text).document
+            if (reparsed != null) {
+                expectEqual(describeTree(reparsed.root), generated.expected, "seed $seed rewritten reads back")
+                val third = xmlWriter()
+                xmlWriteDocument(third, reparsed)
+                expectEqual(third.finish().text, rewritten.text, "seed $seed writing is stable")
+            } else {
+                expect(false, "seed $seed reparses")
+            }
+        }
+        expectEqual(generateDocument(seed).result.text, generated.result.text, "seed $seed is deterministic")
+        seed = seed + 1
+    }
+    testsPassed()
+}

@@ -1,0 +1,292 @@
+// Random documents written through XmlWriter, each with a description of what it
+// should mean that comes from the generator and not from any parser.
+import "../../src/xml.ab"
+import "abla/bytes"
+import "abla/text"
+
+class Random(var state: int) {
+    fun next(): int {
+        state = state ^ (state << 13)
+        state = state ^ (state >>> 7)
+        state = state ^ (state << 17)
+        state >>> 1
+    }
+
+    fun below(bound: int): int = next() % bound
+}
+
+fun randomFrom(seed: int): Random {
+    val random = Random(seed * 2685821657736338717 + 88172645463325252)
+    random.next()
+    random.next()
+    random
+}
+
+fun hexText(text: string): string {
+    val digits = "0123456789abcdef"
+    val out = byteBuffer()
+    for (b in text) {
+        out.appendByteValue(digits[b >> 4])
+        out.appendByteValue(digits[b & 15])
+    }
+    out.toText()
+}
+
+class Generated(
+    val writer: XmlWriter,
+    val random: Random,
+    val unicodeNames: bool,
+    val dump: ByteBuffer,
+    var pending: string,
+    val prefixes: array<string>,
+    val uris: array<string>,
+    var budget: int
+) {
+    fun name(): string {
+        val pool = if (unicodeNames) ["a", "b", "item", "x-1", "_y", "z.2", "café", "世界"]
+            else ["a", "b", "item", "x-1", "_y", "z.2", "Long.Name-99"]
+        pool[random.below(pool.size)]
+    }
+
+    fun value(cdataSafe: bool): string {
+        val pieces = ["", " ", "plain", "<", ">", "&", "\"", "'", "]]>", "]]", "\t", "\n", "\r", "\r\n", "&amp;", "<a>", "--", "?>",
+            "é", "€", "世", "\u{1F600}", "\u0085", " ", "\u007F", "&#10;"]
+        val out = byteBuffer()
+        var count = random.below(6)
+        while (count > 0) {
+            val piece = pieces[random.below(pieces.size)]
+            // Characters no single-byte encoding has can't go in raw sections.
+            if (!cdataSafe || unicodeNames || !hasHighByte(piece)) out.appendText(piece)
+            count = count - 1
+        }
+        out.toText()
+    }
+
+    fun hasHighByte(piece: string): bool {
+        for (b in piece) {
+            if (b >= 0x80) return true
+        }
+        false
+    }
+
+    fun flushText(): void {
+        if (pending.size > 0) {
+            dump.appendText("T ${hexText(pending)}\n")
+            pending = ""
+        }
+        return
+    }
+
+    fun uriOf(prefix: string): string {
+        var i = prefixes.size - 1
+        while (i >= 0) {
+            if (prefixes[i] == prefix) return uris[i]
+            i = i - 1
+        }
+        ""
+    }
+
+    fun element(depth: int): void {
+        budget = budget - 1
+        val scope = prefixes.size
+        flushText()
+        // Namespace declarations first, so names can use them.
+        val declarations: array<string> = []
+        val declaredUris: array<string> = []
+        var count = random.below(3)
+        while (count > 0) {
+            val prefix = ["", "p", "q", "ns1"][random.below(4)]
+            val uri = ["urn:a", "urn:b", "http://example.com/?a=1&b=2"][random.below(3)]
+            var known = false
+            for (candidate in declarations) {
+                if (candidate == prefix) known = true
+            }
+            if (!known) {
+                declarations.append(prefix)
+                declaredUris.append(uri)
+                prefixes.append(prefix)
+                uris.append(uri)
+            }
+            count = count - 1
+        }
+        val prefixChoices: array<string> = [""]
+        for (candidate in prefixes) {
+            if (candidate.size > 0) prefixChoices.append(candidate)
+        }
+        val chosen = prefixChoices[random.below(prefixChoices.size)]
+        val local = name()
+        val qname = if (chosen.size > 0) "$chosen:$local" else local
+        writer.startElement(qname)
+        var i = 0
+        while (i < declarations.size) {
+            writer.namespace(declarations[i], declaredUris[i])
+            i = i + 1
+        }
+        dump.appendText("S {${uriOf(chosen)}}$local\n")
+        // Attributes, sorted for the description by their expanded names.
+        val keys: array<string> = []
+        val values: array<string> = []
+        var attributes = random.below(4)
+        while (attributes > 0) {
+            val attributePrefix = prefixChoices[random.below(prefixChoices.size)]
+            val attributeLocal = name()
+            val attributeName = if (attributePrefix.size > 0) "$attributePrefix:$attributeLocal" else attributeLocal
+            val key = "{${if (attributePrefix.size > 0) uriOf(attributePrefix) else ""}}$attributeLocal"
+            var known = false
+            for (candidate in keys) {
+                if (candidate == key) known = true
+            }
+            if (!known) {
+                val attributeValue = value(false)
+                writer.attribute(attributeName, attributeValue)
+                var at = keys.size
+                keys.append(key)
+                values.append(attributeValue)
+                while (at > 0 && keys[at - 1] > keys[at]) {
+                    val k = keys[at]
+                    keys[at] = keys[at - 1]
+                    keys[at - 1] = k
+                    val v = values[at]
+                    values[at] = values[at - 1]
+                    values[at - 1] = v
+                    at = at - 1
+                }
+            }
+            attributes = attributes - 1
+        }
+        i = 0
+        while (i < keys.size) {
+            dump.appendText("A ${keys[i]} ${hexText(values[i])}\n")
+            i = i + 1
+        }
+        var children = random.below(5)
+        while (children > 0 && budget > 0) {
+            when (random.below(6)) {
+                0, 1 -> {
+                    val text = value(false)
+                    writer.text(text)
+                    pending = pending + text
+                }
+                2 -> {
+                    val text = value(true)
+                    writer.cdata(text)
+                    pending = pending + text
+                }
+                3 -> {
+                    flushText()
+                    val text = safeMarkupText()
+                    writer.comment(text)
+                    dump.appendText("C ${hexText(text)}\n")
+                }
+                4 -> {
+                    flushText()
+                    val text = safeMarkupText().trimStart()
+                    writer.processingInstruction("pi", text)
+                    dump.appendText("P pi ${hexText(text)}\n")
+                }
+                else -> if (depth < 12) element(depth + 1)
+            }
+            children = children - 1
+        }
+        writer.endElement()
+        flushText()
+        dump.appendText("E\n")
+        prefixes.truncate(scope)
+        uris.truncate(scope)
+        return
+    }
+
+    fun safeMarkupText(): string {
+        val words = ["", " note", "a b", "\n", "x-y", "? >", unicodeWord()]
+        words[random.below(words.size)]
+    }
+
+    fun unicodeWord(): string = if (unicodeNames) "é世" else "e"
+}
+
+class GeneratedDocument(val result: XmlWriteResult, val expected: string)
+
+val generatedEncodings = ["UTF-8", "US-ASCII", "ISO-8859-1", "windows-1252"]
+
+// The document for a seed: the same seed always gives the same document.
+fun generateDocument(seed: int): GeneratedDocument {
+    val random = randomFrom(seed)
+    val encoding = generatedEncodings[random.below(generatedEncodings.size)]
+    val writer = xmlWriter(XmlWriterOptions(encoding = encoding))
+    val generated = Generated(writer, random, encoding == "UTF-8", byteBuffer(), "", [], [], 40)
+    writer.declaration()
+    generated.element(0)
+    GeneratedDocument(writer.finish(), generated.dump.toText())
+}
+
+// The same description, from a parsed tree.
+class Held(var text: string)
+
+fun describeNode(var out: ByteBuffer, var text: Held, node: XmlNode): void {
+    when (node) {
+        is XmlText -> text.text = text.text + node.text
+        is XmlComment -> {
+            describeFlush(out, text)
+            out.appendText("C ${hexText(node.text)}\n")
+        }
+        is XmlProcessingInstruction -> {
+            describeFlush(out, text)
+            out.appendText("P ${node.target} ${hexText(node.data)}\n")
+        }
+        is XmlSkippedEntity -> {
+            describeFlush(out, text)
+            out.appendText("X ${node.name}\n")
+        }
+        is XmlElement -> {
+            describeFlush(out, text)
+            describeElement(out, node)
+        }
+    }
+    return
+}
+
+fun describeFlush(var out: ByteBuffer, var text: Held): void {
+    if (text.text.size > 0) {
+        out.appendText("T ${hexText(text.text)}\n")
+        text.text = ""
+    }
+    return
+}
+
+fun describeElement(var out: ByteBuffer, element: XmlElement): void {
+    out.appendText("S {${element.namespaceUri}}${element.localName}\n")
+    val keys: array<string> = []
+    val values: array<string> = []
+    for (attribute in element.attributes) {
+        if (attribute.namespaceUri != xmlNamespaceXmlns) {
+            var at = keys.size
+            keys.append("{${attribute.namespaceUri}}${attribute.localName}")
+            values.append(attribute.value)
+            while (at > 0 && keys[at - 1] > keys[at]) {
+                val k = keys[at]
+                keys[at] = keys[at - 1]
+                keys[at - 1] = k
+                val v = values[at]
+                values[at] = values[at - 1]
+                values[at - 1] = v
+                at = at - 1
+            }
+        }
+    }
+    var i = 0
+    while (i < keys.size) {
+        out.appendText("A ${keys[i]} ${hexText(values[i])}\n")
+        i = i + 1
+    }
+    val text = Held("")
+    for (node in element.children) describeNode(out, text, node)
+    describeFlush(out, text)
+    out.appendText("E\n")
+    return
+}
+
+fun describeTree(element: XmlElement): string {
+    val out = byteBuffer()
+    describeElement(out, element)
+    out.toText()
+}

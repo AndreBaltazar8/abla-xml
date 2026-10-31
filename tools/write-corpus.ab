@@ -1,0 +1,30 @@
+// Writes generated documents and what each should mean, for independent checkers:
+//   write-corpus <directory> <count>
+import "../tests/support/generate.ab"
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+
+fun main: int {
+    val directory = processArgument(0)
+    val count = parseCount(processArgument(1))
+    Path(directory).createDirectories()
+    var seed = 1
+    while (seed <= count) {
+        val generated = generateDocument(seed)
+        if (!generated.result.succeeded) {
+            eprintln("seed $seed: ${generated.result.errorCode}")
+            return 1
+        }
+        Path("$directory/$seed.xml").writeText(generated.result.text)
+        Path("$directory/$seed.expected").writeText(generated.expected)
+        seed = seed + 1
+    }
+    0
+}
+
+fun parseCount(text: string): int {
+    var value = 0
+    for (b in text) value = value * 10 + (b - 48)
+    value
+}
