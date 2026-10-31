@@ -1,0 +1,64 @@
+// Builds a tree from the reader's events.
+import "abla/bytes"
+import "reader.ab"
+import "tree.ab"
+
+class XmlParseResult(
+    val succeeded: bool,
+    val document: XmlDocument?,
+    val error: XmlError?
+)
+
+private fun xmlMiscNode(event: XmlEvent): XmlNode =
+    if (event.kind == xmlEventComment) XmlComment(event.value)
+    else XmlProcessingInstruction(event.name, event.value)
+
+// Parses a whole document into a tree. Adjacent text becomes one XmlText;
+// a CDATA section stays its own.
+fun xmlParse(source: string, options: XmlOptions = XmlOptions()): XmlParseResult {
+    val reader = xmlReader(source, options)
+    val prolog: array<XmlNode> = []
+    val epilog: array<XmlNode> = []
+    val open: array<XmlElement> = []
+    var root: XmlElement? = null
+    while (true) {
+        val event = reader.next()
+        val kind = event.kind
+        if (kind == xmlEventError) return XmlParseResult(false, null, reader.error)
+        if (kind == xmlEventEndOfDocument) break
+        if (kind == xmlEventStart) {
+            val element = XmlElement(event.name, event.prefix, event.localName, event.namespaceUri,
+                event.attributes, [], event.byteOffset, event.line, event.column)
+            if (open.size > 0) {
+                open[open.size - 1].children.append(element)
+            } else {
+                root = element
+            }
+            open.append(element)
+        } else if (kind == xmlEventEnd) {
+            open.truncate(open.size - 1)
+        } else if (open.size > 0) {
+            val top = open.size - 1
+            if (kind == xmlEventText) {
+                open[top].children.append(XmlText(event.value))
+            } else if (kind == xmlEventCdata) {
+                open[top].children.append(XmlText(event.value, true))
+            } else if (kind == xmlEventSkippedEntity) {
+                open[top].children.append(XmlSkippedEntity(event.name))
+            } else {
+                open[top].children.append(xmlMiscNode(event))
+            }
+        } else if (root == null) {
+            prolog.append(xmlMiscNode(event))
+        } else {
+            epilog.append(xmlMiscNode(event))
+        }
+    }
+    val found = root
+    if (found == null) {
+        return XmlParseResult(false, null, XmlError("missing_root", "no root element", 0, 1, 1))
+    }
+    XmlParseResult(true, XmlDocument(reader.version, reader.declaredEncoding, reader.standalone,
+        reader.doctype, prolog, found, epilog, reader.skippedEntities), null)
+}
+

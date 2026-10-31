@@ -1,0 +1,1601 @@
+// A bounded, non-validating, pull XML 1.0 (Fifth Edition) parser with namespaces.
+//
+// Safety properties, each enforced here and tested:
+// - No I/O. External entities and external DTD subsets are never read.
+// - A DOCTYPE is an error unless XmlOptions.allowDtd asks for it.
+// - With a DTD, every entity expansion is charged to one budget of expansions
+//   and of bytes, so a small document can't expand into a big one.
+// - Everything else that could grow with hostile input has a limit too, and the
+//   parser doesn't recurse with the document's depth.
+import "abla/bytes"
+import "abla/text"
+import "chars.ab"
+import "encoding.ab"
+import "tree.ab"
+
+class XmlOptions(
+    // Largest source document.
+    val maxBytes: int = 67108864,
+    val maxDepth: int = 256,
+    // Events a document may produce (elements, text runs, comments, ...).
+    val maxNodes: int = 16777216,
+    val maxAttributes: int = 1024,
+    val maxNameBytes: int = 65536,
+    // Namespace declarations in scope at once.
+    val maxNamespaces: int = 1024,
+    // Largest single text run, attribute value, comment or instruction.
+    val maxValueBytes: int = 33554432,
+    // Namespaces in XML. Off, names are plain XML 1.0 names and may hold any
+    // number of colons, and no prefix is looked up.
+    val namespaces: bool = true,
+    // Whether a DOCTYPE is allowed. Its internal subset is then checked and
+    // used, within the entity limits below. External subsets and external
+    // entities are still not read: see XmlSkippedEntity.
+    val allowDtd: bool = false,
+    // Entity references a document may expand, in total.
+    val maxEntityExpansions: int = 4096,
+    // Bytes of replacement text a document may expand, in total.
+    val maxEntityBytes: int = 1048576,
+    // How deep references inside replacement text may nest.
+    val maxEntityDepth: int = 16
+)
+
+class XmlError(
+    val code: string,
+    val message: string,
+    // Where in the document, counted in the decoded UTF-8 text plus any byte
+    // order mark; inside an entity, the reference to the outermost one.
+    val byteOffset: int,
+    // One-based. A column counts characters; CR, LF and CRLF end a line.
+    val line: int,
+    val column: int,
+    // The innermost entity being expanded, or "".
+    val entity: string = ""
+)
+
+val xmlEventStart = 1
+val xmlEventEnd = 2
+val xmlEventText = 3
+val xmlEventCdata = 4
+val xmlEventComment = 5
+val xmlEventProcessingInstruction = 6
+val xmlEventSkippedEntity = 7
+val xmlEventEndOfDocument = 8
+val xmlEventError = 9
+
+class XmlEvent(
+    val kind: int,
+    // The element's QName, the instruction's target or the entity's name.
+    val name: string = "",
+    val prefix: string = "",
+    val localName: string = "",
+    val namespaceUri: string = "",
+    // The text, comment or instruction data.
+    val value: string = "",
+    val attributes: array<XmlAttribute> = [],
+    val byteOffset: int = 0,
+    val line: int = 0,
+    val column: int = 0
+)
+
+class XmlEntityDeclaration(
+    val value: string,
+    val external: bool,
+    val unparsed: bool
+)
+
+class XmlAttributeDeclaration(
+    val name: string,
+    val tokenized: bool,
+    val hasDefault: bool,
+    val defaultValue: string
+)
+
+private val PHASE_PROLOG = 0
+private val PHASE_CONTENT = 1
+private val PHASE_EPILOG = 2
+private val PHASE_DONE = 3
+
+private val LT = 60
+private val GT = 62
+private val AMP = 38
+private val QUOTE = 34
+private val APOS = 39
+private val SLASH = 47
+private val BANG = 33
+private val QUESTION = 63
+private val EQUALS = 61
+private val PERCENT = 37
+private val SEMI = 59
+private val HASH = 35
+private val LBRACKET = 91
+private val RBRACKET = 93
+private val LPAREN = 40
+private val RPAREN = 41
+private val PIPE = 124
+private val COMMA = 44
+private val CR = 13
+private val LF = 10
+
+class XmlReader(
+    val options: XmlOptions,
+    var src: string,
+    var pos: int,
+    val bias: int,
+    val frameText: array<string>,
+    val framePos: array<int>,
+    val frameName: array<string>,
+    val frameDepth: array<int>,
+    val attributeActive: array<string>,
+    val elementNames: array<string>,
+    val nsPrefixes: array<string>,
+    val nsUris: array<string>,
+    val nsMarks: array<int>,
+    val generalEntities: Map<string, XmlEntityDeclaration>,
+    val parameterEntities: Map<string, XmlEntityDeclaration>,
+    val attlists: Map<string, array<XmlAttributeDeclaration>>,
+    var buffer: ByteBuffer,
+    var bufferOffset: int = -1,
+    var phase: int = 0,
+    var started: bool = false,
+    var pendingEnd: bool = false,
+    var pendingEndName: string = "",
+    var pendingEndPrefix: string = "",
+    var pendingEndLocal: string = "",
+    var pendingEndNs: string = "",
+    var nodes: int = 0,
+    var expansions: int = 0,
+    var expandedBytes: int = 0,
+    var refEnd: int = 0,
+    var version: string = "1.0",
+    var declaredEncoding: string = "",
+    var standalone: string = "",
+    var doctype: XmlDoctype? = null,
+    var doctypeSeen: bool = false,
+    var externalSubset: bool = false,
+    var parameterReferenceSeen: bool = false,
+    // After a parameter entity that wasn't read, declarations can't be trusted
+    // (XML 1.0 section 5.1): they are checked but not used.
+    var stopDeclarations: bool = false,
+    var skippedEntities: int = 0,
+    var error: XmlError? = null,
+    var lineTracked: int = 1,
+    var columnTracked: int = 1,
+    var offsetTracked: int = 0,
+    var lastCr: bool = false,
+    var pendingSkipped: string? = null,
+    var lastPublicId: string = "",
+    var lastSystemId: string = ""
+) {
+    // The next event. After the end of the document or an error, the same
+    // event again.
+    fun next(): XmlEvent {
+        val failure = error
+        if (failure != null) return errorEvent(failure)
+        if (phase == PHASE_DONE) return XmlEvent(xmlEventEndOfDocument)
+        val event = advance()
+        val after = error
+        if (after != null) return errorEvent(after)
+        if (event == null) return errorEvent(XmlError("internal", "no event", 0, 1, 1))
+        nodes = nodes + 1
+        if (nodes > options.maxNodes) {
+            fail("too_many_nodes", "more than ${options.maxNodes} nodes")
+            return next()
+        }
+        event
+    }
+
+    fun errorEvent(failure: XmlError): XmlEvent =
+        XmlEvent(xmlEventError, value = failure.message, byteOffset = failure.byteOffset,
+            line = failure.line, column = failure.column)
+
+    fun level(): int = frameText.size
+
+    fun baseOffset(): int = if (frameText.size == 0) pos else framePos[0]
+
+    fun fail(code: string, message: string): bool {
+        if (error == null) {
+            val offset = baseOffset()
+            track(offset)
+            val entity = if (frameName.size > 0) frameName[frameName.size - 1] else ""
+            error = XmlError(code, message, offset + bias, lineTracked, columnTracked, entity)
+        }
+        false
+    }
+
+    // Moves the line and column on to an offset of the document, or starts
+    // again for an offset behind them.
+    fun track(offset: int): void {
+        val text = if (frameText.size == 0) src else frameText[0]
+        if (offset < offsetTracked) {
+            offsetTracked = 0
+            lineTracked = 1
+            columnTracked = 1
+            lastCr = false
+        }
+        var i = offsetTracked
+        var line = lineTracked
+        var column = columnTracked
+        var wasCr = lastCr
+        val end = if (offset < text.size) offset else text.size
+        while (i < end) {
+            val b = text[i]
+            if (b == LF) {
+                if (!wasCr) {
+                    line = line + 1
+                }
+                column = 1
+                wasCr = false
+            } else if (b == CR) {
+                line = line + 1
+                column = 1
+                wasCr = true
+            } else {
+                if ((b & 0xC0) != 0x80) column = column + 1
+                wasCr = false
+            }
+            i = i + 1
+        }
+        offsetTracked = i
+        lineTracked = line
+        columnTracked = column
+        lastCr = wasCr
+        return
+    }
+
+    fun positioned(kind: int, offset: int, name: string, value: string): XmlEvent {
+        track(offset)
+        XmlEvent(kind, name = name, value = value, byteOffset = offset + bias,
+            line = lineTracked, column = columnTracked)
+    }
+
+    fun atEnd(): bool = pos >= src.size
+
+    fun looking(text: string): bool {
+        val n = text.size
+        if (pos + n > src.size) return false
+        var i = 0
+        while (i < n) {
+            if (src[pos + i] != text[i]) return false
+            i = i + 1
+        }
+        true
+    }
+
+    fun skipSpace(): bool {
+        val begin = pos
+        while (pos < src.size && xmlIsSpace(src[pos])) pos = pos + 1
+        pos > begin
+    }
+
+    fun requireSpace(): bool {
+        if (skipSpace()) return true
+        fail("expected_space", "expected whitespace")
+    }
+
+    fun expectByte(byte: int, what: string): bool {
+        if (pos < src.size && src[pos] == byte) {
+            pos = pos + 1
+            return true
+        }
+        fail("unexpected_token", "expected $what")
+    }
+
+    // Reads a Name at the cursor; "" after failing.
+    fun readName(): string {
+        val begin = pos
+        val size = src.size
+        if (pos >= size) {
+            fail("expected_name", "expected a name")
+            return ""
+        }
+        val first = xmlCodePointAt(src, pos)
+        if (!xmlIsNameStart(first)) {
+            fail("expected_name", "expected a name")
+            return ""
+        }
+        pos = pos + xmlUtf8Size(src[pos])
+        while (pos < size) {
+            val b = src[pos]
+            if (b < 0x80) {
+                if (!((b >= 97 && b <= 122) || (b >= 65 && b <= 90) ||
+                    (b >= 48 && b <= 58) || b == 95 || b == 45 || b == 46)) break
+                pos = pos + 1
+            } else {
+                if (!xmlIsNameChar(xmlCodePointAt(src, pos))) break
+                pos = pos + xmlUtf8Size(b)
+            }
+        }
+        if (pos - begin > options.maxNameBytes) {
+            fail("name_too_long", "a name is longer than ${options.maxNameBytes} bytes")
+            return ""
+        }
+        src.slice(begin, pos)
+    }
+
+    // A name that may not hold a colon once namespaces are on.
+    fun readDeclaredName(): string {
+        val name = readName()
+        if (name.size > 0 && options.namespaces && name.indexOf(":") >= 0) {
+            fail("invalid_qname", "a colon in the name $name")
+            return ""
+        }
+        name
+    }
+
+    // Line endings as XML 1.0 section 2.11 wants them. Only text straight from
+    // the document has any to normalize: a CR in replacement text came from a
+    // character reference.
+    fun sourceText(begin: int, end: int): string {
+        if (frameText.size > 0) return src.slice(begin, end)
+        var i = begin
+        while (i < end && src[i] != CR) i = i + 1
+        if (i == end) return src.slice(begin, end)
+        val out = byteBuffer()
+        var run = begin
+        while (i < end) {
+            if (src[i] == CR) {
+                if (i > run) out.appendText(src.slice(run, i))
+                out.appendText("\n")
+                if (i + 1 < src.size && src[i + 1] == LF) i = i + 1
+                run = i + 1
+            }
+            i = i + 1
+        }
+        if (end > run) out.appendText(src.slice(run, end))
+        out.toText()
+    }
+
+    fun advance(): XmlEvent? {
+        if (pendingEnd) {
+            pendingEnd = false
+            val offset = baseOffset()
+            track(offset)
+            popElementScope()
+            if (elementNames.size == 0) phase = PHASE_EPILOG
+            return XmlEvent(xmlEventEnd, name = pendingEndName, prefix = pendingEndPrefix,
+                localName = pendingEndLocal, namespaceUri = pendingEndNs,
+                byteOffset = offset + bias, line = lineTracked, column = columnTracked)
+        }
+        if (!started) {
+            started = true
+            if (!parseXmlDeclaration()) return null
+        }
+        if (phase == PHASE_CONTENT) return advanceContent()
+        advanceMisc()
+    }
+
+    // The prolog and what follows the root element.
+    fun advanceMisc(): XmlEvent? {
+        skipSpace()
+        val offset = pos
+        if (atEnd()) {
+            if (phase == PHASE_PROLOG) {
+                fail("missing_root", "the document has no root element")
+                return null
+            }
+            phase = PHASE_DONE
+            return positioned(xmlEventEndOfDocument, offset, "", "")
+        }
+        if (src[pos] != LT) {
+            fail("content_outside_root", "text outside the root element")
+            return null
+        }
+        if (looking("<!--")) return readComment()
+        if (looking("<?")) return readProcessingInstruction()
+        if (looking("<!DOCTYPE")) {
+            if (phase != PHASE_PROLOG || doctypeSeen) {
+                fail("misplaced_doctype", "a DOCTYPE must come once, before the root")
+                return null
+            }
+            if (!options.allowDtd) {
+                fail("dtd_forbidden", "this parser's options don't allow a DOCTYPE")
+                return null
+            }
+            if (!parseDoctype()) return null
+            return advanceMisc()
+        }
+        if (phase == PHASE_EPILOG) {
+            fail("multiple_roots", "content after the root element")
+            return null
+        }
+        phase = PHASE_CONTENT
+        readStartTag()
+    }
+
+    fun flushText(): XmlEvent {
+        val value = buffer.toText()
+        val offset = bufferOffset
+        buffer = byteBuffer()
+        bufferOffset = -1
+        positioned(xmlEventText, offset, "", value)
+    }
+
+    fun noteText(): void {
+        if (bufferOffset < 0) bufferOffset = baseOffset()
+        return
+    }
+
+    fun advanceContent(): XmlEvent? {
+        while (true) {
+            if (pos >= src.size) {
+                if (frameText.size == 0) {
+                    fail("unexpected_end", "element ${elementNames[elementNames.size - 1]} is not closed")
+                    return null
+                }
+                if (frameDepth[frameDepth.size - 1] != elementNames.size) {
+                    fail("entity_unbalanced", "an entity's content must be balanced")
+                    return null
+                }
+                popFrame()
+            } else {
+                val b = src[pos]
+                if (b == LT) {
+                    if (buffer.size() > 0) return flushText()
+                    return readMarkup()
+                }
+                if (b == AMP) {
+                    val skipped = readContentReference()
+                    if (error != null) return null
+                    if (skipped != null) {
+                        // The text before it comes first.
+                        if (buffer.size() > 0) {
+                            pendingSkipped = skipped
+                            return flushText()
+                        }
+                        return skippedEvent(skipped)
+                    }
+                } else {
+                    if (!readTextRun()) return null
+                }
+            }
+            val waiting = pendingSkipped
+            if (waiting != null) {
+                pendingSkipped = null
+                return skippedEvent(waiting)
+            }
+        }
+        null
+    }
+
+    fun skippedEvent(name: string): XmlEvent {
+        skippedEntities = skippedEntities + 1
+        positioned(xmlEventSkippedEntity, baseOffset(), name, "")
+    }
+
+    fun readTextRun(): bool {
+        val begin = pos
+        val size = src.size
+        val text = src
+        var i = pos
+        while (i < size) {
+            val b = text[i]
+            if (b == LT || b == AMP) break
+            if (b == RBRACKET && i + 2 < size && text[i + 1] == RBRACKET && text[i + 2] == GT) {
+                pos = i
+                return fail("cdata_end_in_text", "]]> in text")
+            }
+            i = i + 1
+        }
+        noteText()
+        buffer.appendText(sourceText(begin, i))
+        pos = i
+        if (buffer.size() > options.maxValueBytes) {
+            return fail("value_too_long", "a text run is longer than ${options.maxValueBytes} bytes")
+        }
+        true
+    }
+
+    // Handles a reference in content. Gives the name of an entity it can't read.
+    fun readContentReference(): string? {
+        if (pos + 1 < src.size && src[pos + 1] == HASH) {
+            val cp = readCharRef(src, pos)
+            if (cp < 0) return null
+            noteText()
+            buffer.appendText(utf8Encode(cp))
+            pos = refEnd
+            return null
+        }
+        val name = readRefName(src, pos)
+        if (name.size == 0) return null
+        val predefined = xmlPredefinedEntity(name)
+        if (predefined.size > 0) {
+            noteText()
+            buffer.appendText(predefined)
+            pos = refEnd
+            return null
+        }
+        val declared = generalEntities.get(name)
+        if (declared == null) {
+            if (undeclaredIsFatal()) {
+                fail("undeclared_entity", "entity $name is not declared")
+                return null
+            }
+            pos = refEnd
+            return name
+        }
+        if (declared.unparsed) {
+            fail("unparsed_entity", "a reference to unparsed entity $name")
+            return null
+        }
+        if (declared.external) {
+            pos = refEnd
+            return name
+        }
+        val key = "&$name"
+        if (xmlListHas(frameName, key)) {
+            fail("entity_recursion", "entity $name refers to itself")
+            return null
+        }
+        if (!chargeEntity(name, declared.value.size)) return null
+        pushFrame(key, declared.value, elementNames.size, refEnd)
+        null
+    }
+
+    fun pushFrame(name: string, text: string, depth: int, resumeAt: int): void {
+        frameText.append(src)
+        framePos.append(resumeAt)
+        frameName.append(name)
+        frameDepth.append(depth)
+        src = text
+        pos = 0
+        return
+    }
+
+    fun popFrame(): void {
+        val top = frameText.size - 1
+        src = frameText[top]
+        pos = framePos[top]
+        frameText.truncate(top)
+        framePos.truncate(top)
+        frameName.truncate(top)
+        frameDepth.truncate(top)
+        return
+    }
+
+    fun chargeEntity(name: string, size: int): bool {
+        expansions = expansions + 1
+        expandedBytes = expandedBytes + size
+        if (expansions > options.maxEntityExpansions) {
+            return fail("entity_limit", "more than ${options.maxEntityExpansions} entity expansions")
+        }
+        if (expandedBytes > options.maxEntityBytes) {
+            return fail("entity_limit", "entities expand to more than ${options.maxEntityBytes} bytes")
+        }
+        if (frameName.size + attributeActive.size >= options.maxEntityDepth) {
+            return fail("entity_limit", "entity references nest deeper than ${options.maxEntityDepth}")
+        }
+        true
+    }
+
+    // XML 1.0 section 4.1, well-formedness constraint Entity Declared.
+    fun undeclaredIsFatal(): bool =
+        standalone == "yes" || (!externalSubset && !parameterReferenceSeen)
+
+    // Reads &name; at `at` of `text`; "" after failing. refEnd is past the ;.
+    fun readRefName(text: string, at: int): string {
+        var i = at + 1
+        val size = text.size
+        if (i >= size || !xmlIsNameStart(xmlCodePointAt(text, i))) {
+            fail("invalid_reference", "& must start a reference")
+            return ""
+        }
+        i = i + xmlUtf8Size(text[i])
+        while (i < size && text[i] != SEMI) {
+            if (!xmlIsNameChar(xmlCodePointAt(text, i))) {
+                fail("invalid_reference", "a reference must end with ;")
+                return ""
+            }
+            i = i + xmlUtf8Size(text[i])
+        }
+        if (i >= size) {
+            fail("invalid_reference", "a reference must end with ;")
+            return ""
+        }
+        if (i - at > options.maxNameBytes) {
+            fail("name_too_long", "a name is longer than ${options.maxNameBytes} bytes")
+            return ""
+        }
+        refEnd = i + 1
+        text.slice(at + 1, i)
+    }
+
+    // Reads &#...; at `at` of `text`; -1 after failing. refEnd is past the ;.
+    fun readCharRef(text: string, at: int): int {
+        var i = at + 2
+        val size = text.size
+        var value = 0
+        var digits = 0
+        val hex = i < size && text[i] == 120
+        if (hex) i = i + 1
+        while (i < size && text[i] != SEMI) {
+            val b = text[i]
+            var digit = -1
+            if (b >= 48 && b <= 57) digit = b - 48
+            if (hex && b >= 97 && b <= 102) digit = b - 87
+            if (hex && b >= 65 && b <= 70) digit = b - 55
+            if (digit < 0) {
+                fail("invalid_reference", "a bad digit in a character reference")
+                return -1
+            }
+            value = value * (if (hex) 16 else 10) + digit
+            if (value > 0x10FFFF) value = 0x110000
+            digits = digits + 1
+            i = i + 1
+        }
+        if (i >= size || digits == 0) {
+            fail("invalid_reference", "an unfinished character reference")
+            return -1
+        }
+        if (!xmlIsChar(value)) {
+            fail("invalid_char", "a reference to a character XML forbids")
+            return -1
+        }
+        refEnd = i + 1
+        value
+    }
+
+    fun readMarkup(): XmlEvent? {
+        val next = if (pos + 1 < src.size) src[pos + 1] else 0
+        if (next == SLASH) return readEndTag()
+        if (next == QUESTION) return readProcessingInstruction()
+        if (next == BANG) {
+            if (looking("<!--")) return readComment()
+            if (looking("<![CDATA[")) return readCdata()
+            fail("unexpected_token", "unknown markup")
+            return null
+        }
+        readStartTag()
+    }
+
+    fun readCdata(): XmlEvent? {
+        val offset = baseOffset()
+        val begin = pos + 9
+        val end = src.indexOf("]]>", begin)
+        if (end < 0) {
+            fail("unexpected_end", "an unfinished CDATA section")
+            return null
+        }
+        if (end - begin > options.maxValueBytes) {
+            fail("value_too_long", "a CDATA section is longer than ${options.maxValueBytes} bytes")
+            return null
+        }
+        val value = sourceText(begin, end)
+        pos = end + 3
+        positioned(xmlEventCdata, offset, "", value)
+    }
+
+    fun readComment(): XmlEvent? {
+        val offset = baseOffset()
+        val begin = pos + 4
+        val end = src.indexOf("--", begin)
+        if (end < 0) {
+            fail("unexpected_end", "an unfinished comment")
+            return null
+        }
+        if (end + 2 >= src.size || src[end + 2] != GT) {
+            pos = end
+            fail("invalid_comment", "-- in a comment")
+            return null
+        }
+        if (end - begin > options.maxValueBytes) {
+            fail("value_too_long", "a comment is longer than ${options.maxValueBytes} bytes")
+            return null
+        }
+        val value = sourceText(begin, end)
+        pos = end + 3
+        positioned(xmlEventComment, offset, "", value)
+    }
+
+    fun readProcessingInstruction(): XmlEvent? {
+        val offset = baseOffset()
+        pos = pos + 2
+        val target = readDeclaredName()
+        if (target.size == 0) return null
+        if (target.lowercase() == "xml") {
+            fail("reserved_target", "a processing instruction can't be called $target")
+            return null
+        }
+        if (looking("?>")) {
+            pos = pos + 2
+            return positioned(xmlEventProcessingInstruction, offset, target, "")
+        }
+        if (!requireSpace()) return null
+        val begin = pos
+        val end = src.indexOf("?>", begin)
+        if (end < 0) {
+            fail("unexpected_end", "an unfinished processing instruction")
+            return null
+        }
+        if (end - begin > options.maxValueBytes) {
+            fail("value_too_long", "an instruction is longer than ${options.maxValueBytes} bytes")
+            return null
+        }
+        val value = sourceText(begin, end)
+        pos = end + 2
+        positioned(xmlEventProcessingInstruction, offset, target, value)
+    }
+
+    fun readEndTag(): XmlEvent? {
+        val offset = baseOffset()
+        val depth = elementNames.size
+        val tagStart = pos
+        if (frameDepth.size > 0 && frameDepth[frameDepth.size - 1] == depth) {
+            fail("entity_unbalanced", "an entity closes an element it didn't open")
+            return null
+        }
+        pos = pos + 2
+        val name = readName()
+        if (name.size == 0) return null
+        skipSpace()
+        if (!expectByte(GT, "> after an end tag's name")) return null
+        val expected = elementNames[depth - 1]
+        if (name != expected) {
+            pos = tagStart
+            fail("tag_mismatch", "</$name> where </$expected> belongs")
+            return null
+        }
+        pendingEndName = name
+        resolveEndName(name)
+        popElementScope()
+        if (elementNames.size == 0) phase = PHASE_EPILOG
+        track(offset)
+        XmlEvent(xmlEventEnd, name = name, prefix = pendingEndPrefix,
+            localName = pendingEndLocal, namespaceUri = pendingEndNs,
+            byteOffset = offset + bias, line = lineTracked, column = columnTracked)
+    }
+
+    fun resolveEndName(name: string): void {
+        if (options.namespaces) {
+            pendingEndPrefix = xmlPrefixOf(name)
+            pendingEndLocal = xmlLocalOf(name)
+            pendingEndNs = lookupPrefix(pendingEndPrefix)
+        } else {
+            pendingEndPrefix = ""
+            pendingEndLocal = name
+            pendingEndNs = ""
+        }
+        return
+    }
+
+    fun popElementScope(): void {
+        val top = elementNames.size - 1
+        elementNames.truncate(top)
+        nsPrefixes.truncate(nsMarks[top])
+        nsUris.truncate(nsMarks[top])
+        nsMarks.truncate(top)
+        return
+    }
+
+    fun lookupPrefix(prefix: string): string {
+        if (prefix == "xml") return xmlNamespaceXml
+        if (prefix == "xmlns") return xmlNamespaceXmlns
+        var i = nsPrefixes.size - 1
+        while (i >= 0) {
+            if (nsPrefixes[i] == prefix) return nsUris[i]
+            i = i - 1
+        }
+        ""
+    }
+
+    fun prefixBound(prefix: string): bool {
+        if (prefix == "xml" || prefix == "xmlns") return true
+        var i = nsPrefixes.size - 1
+        while (i >= 0) {
+            if (nsPrefixes[i] == prefix) return true
+            i = i - 1
+        }
+        false
+    }
+
+    fun readStartTag(): XmlEvent? {
+        val offset = baseOffset()
+        val tagStart = pos
+        pos = pos + 1
+        if (elementNames.size >= options.maxDepth) {
+            fail("too_deep", "elements nest deeper than ${options.maxDepth}")
+            return null
+        }
+        val name = readName()
+        if (name.size == 0) return null
+        val names: array<string> = []
+        val values: array<string> = []
+        var selfClosed = false
+        while (true) {
+            val spaced = skipSpace()
+            if (atEnd()) {
+                fail("unexpected_end", "an unfinished start tag")
+                return null
+            }
+            val b = src[pos]
+            if (b == GT) {
+                pos = pos + 1
+                break
+            }
+            if (b == SLASH) {
+                pos = pos + 1
+                if (!expectByte(GT, "> after /")) return null
+                selfClosed = true
+                break
+            }
+            if (!spaced) {
+                fail("expected_space", "expected whitespace before an attribute")
+                return null
+            }
+            val attribute = readName()
+            if (attribute.size == 0) return null
+            skipSpace()
+            if (!expectByte(EQUALS, "= after an attribute's name")) return null
+            skipSpace()
+            val value = readAttributeValue()
+            if (error != null) return null
+            names.append(attribute)
+            values.append(value)
+            if (names.size > options.maxAttributes) {
+                fail("too_many_attributes", "more than ${options.maxAttributes} attributes")
+                return null
+            }
+        }
+        // Errors about the tag as a whole are reported at its start.
+        val tagEnd = pos
+        pos = tagStart
+        if (xmlHasDuplicate(names)) {
+            fail("duplicate_attribute", "an attribute appears twice on $name")
+            return null
+        }
+        val specified = names.size
+        applyDeclarations(name, names, values)
+        if (error != null) return null
+        val attributes: array<XmlAttribute> = []
+        var prefix = ""
+        var localName = name
+        var namespaceUri = ""
+        elementNames.append(name)
+        nsMarks.append(nsPrefixes.size)
+        if (options.namespaces) {
+            var i = 0
+            while (i < names.size) {
+                val attribute = names[i]
+                if (attribute == "xmlns" || attribute.startsWith("xmlns:")) {
+                    val declared = if (attribute == "xmlns") "" else attribute.slice(6, attribute.size)
+                    if (attribute != "xmlns" && !xmlIsNcName(declared)) {
+                        fail("invalid_qname", "bad namespace prefix in $attribute")
+                        return null
+                    }
+                    val problem = xmlNamespaceDeclarationError(declared, values[i])
+                    if (problem.size > 0) {
+                        fail(problem, "namespace declaration $attribute is not allowed")
+                        return null
+                    }
+                    if (nsPrefixes.size >= options.maxNamespaces) {
+                        fail("too_many_namespaces", "more than ${options.maxNamespaces} namespace declarations in scope")
+                        return null
+                    }
+                    nsPrefixes.append(declared)
+                    nsUris.append(values[i])
+                }
+                i = i + 1
+            }
+            if (!xmlIsQName(name)) {
+                fail("invalid_qname", "bad element name $name")
+                return null
+            }
+            prefix = xmlPrefixOf(name)
+            localName = xmlLocalOf(name)
+            if (prefix.size > 0 && !prefixBound(prefix)) {
+                fail("undeclared_prefix", "prefix $prefix is not declared")
+                return null
+            }
+            if (prefix == "xmlns") {
+                fail("reserved_namespace_prefix", "an element can't use the prefix xmlns")
+                return null
+            }
+            namespaceUri = lookupPrefix(prefix)
+        }
+        val expanded: array<string> = []
+        var i = 0
+        while (i < names.size) {
+            val attribute = names[i]
+            if (options.namespaces) {
+                if (!xmlIsQName(attribute)) {
+                    fail("invalid_qname", "bad attribute name $attribute")
+                    return null
+                }
+                val attributePrefix = xmlPrefixOf(attribute)
+                val local = xmlLocalOf(attribute)
+                var uri = ""
+                if (attribute == "xmlns") {
+                    uri = xmlNamespaceXmlns
+                } else if (attributePrefix.size > 0) {
+                    if (!prefixBound(attributePrefix)) {
+                        fail("undeclared_prefix", "prefix $attributePrefix is not declared")
+                        return null
+                    }
+                    uri = lookupPrefix(attributePrefix)
+                }
+                expanded.append("{$uri}$local")
+                attributes.append(XmlAttribute(attribute, attributePrefix, local, uri, values[i], i < specified))
+            } else {
+                attributes.append(XmlAttribute(attribute, "", attribute, "", values[i], i < specified))
+            }
+            i = i + 1
+        }
+        if (options.namespaces && xmlHasDuplicate(expanded)) {
+            fail("duplicate_attribute", "two attributes on $name have one expanded name")
+            return null
+        }
+        pos = tagEnd
+        if (selfClosed) {
+            pendingEnd = true
+            pendingEndName = name
+            pendingEndPrefix = prefix
+            pendingEndLocal = localName
+            pendingEndNs = namespaceUri
+        }
+        track(offset)
+        XmlEvent(xmlEventStart, name = name, prefix = prefix, localName = localName,
+            namespaceUri = namespaceUri, attributes = attributes,
+            byteOffset = offset + bias, line = lineTracked, column = columnTracked)
+    }
+
+    // Finds the end of a quoted literal at the cursor; -1 after failing.
+    fun readLiteralEnd(): int {
+        if (atEnd() || (src[pos] != QUOTE && src[pos] != APOS)) {
+            fail("expected_quote", "expected a quoted value")
+            return -1
+        }
+        val end = src.indexOf(if (src[pos] == QUOTE) "\"" else "'", pos + 1)
+        if (end < 0) {
+            fail("unexpected_end", "an unfinished quoted value")
+            return -1
+        }
+        end
+    }
+
+    fun readAttributeValue(): string {
+        val end = readLiteralEnd()
+        if (end < 0) return ""
+        val out = byteBuffer()
+        val literal = src.slice(pos + 1, end)
+        if (!expandAttribute(out, literal, frameText.size == 0, pos + 1)) return ""
+        pos = end + 1
+        out.toText()
+    }
+
+    // XML 1.0 section 3.3.3, for CDATA attributes. `base` is the offset of the
+    // text in the current input while it is a literal from there, else -1.
+    fun expandAttribute(var out: ByteBuffer, text: string, fromDocument: bool, base: int): bool {
+        val size = text.size
+        var i = 0
+        var run = 0
+        while (i < size) {
+            val b = text[i]
+            if (b == LT || b == AMP || b == 9 || b == 10 || b == 13) {
+                if (base >= 0) pos = base + i
+                if (i > run) out.appendText(text.slice(run, i))
+                if (b == LT) return fail("lt_in_attribute", "< in an attribute value")
+                if (b == AMP) {
+                    if (i + 1 < size && text[i + 1] == HASH) {
+                        val cp = readCharRef(text, i)
+                        if (cp < 0) return false
+                        out.appendText(utf8Encode(cp))
+                        i = refEnd
+                    } else {
+                        val name = readRefName(text, i)
+                        if (name.size == 0) return false
+                        i = refEnd
+                        if (!expandAttributeEntity(out, name)) return false
+                    }
+                } else {
+                    out.appendText(" ")
+                    if (fromDocument && b == CR && i + 1 < size && text[i + 1] == LF) i = i + 1
+                    i = i + 1
+                }
+                run = i
+                if (out.size() > options.maxValueBytes) {
+                    return fail("value_too_long", "an attribute value is longer than ${options.maxValueBytes} bytes")
+                }
+            } else {
+                i = i + 1
+            }
+        }
+        if (size > run) out.appendText(if (run == 0) text else text.slice(run, size))
+        if (out.size() > options.maxValueBytes) {
+            return fail("value_too_long", "an attribute value is longer than ${options.maxValueBytes} bytes")
+        }
+        true
+    }
+
+    fun expandAttributeEntity(var out: ByteBuffer, name: string): bool {
+        val predefined = xmlPredefinedEntity(name)
+        if (predefined.size > 0) {
+            out.appendText(predefined)
+            return true
+        }
+        val declared = generalEntities.get(name)
+        if (declared == null) {
+            if (undeclaredIsFatal()) return fail("undeclared_entity", "entity $name is not declared")
+            skippedEntities = skippedEntities + 1
+            return true
+        }
+        if (declared.unparsed) return fail("unparsed_entity", "a reference to unparsed entity $name")
+        if (declared.external) return fail("external_entity_in_attribute", "external entity $name in an attribute value")
+        if (xmlListHas(attributeActive, name) || xmlListHas(frameName, "&$name")) {
+            return fail("entity_recursion", "entity $name refers to itself")
+        }
+        if (!chargeEntity(name, declared.value.size)) return false
+        attributeActive.append(name)
+        val ok = expandAttribute(out, declared.value, false, -1)
+        attributeActive.truncate(attributeActive.size - 1)
+        ok
+    }
+
+    // Applies what the DTD says: normalizes tokenized values and adds defaults.
+    fun applyDeclarations(element: string, var names: array<string>, var values: array<string>): void {
+        val declarations = attlists.get(element)
+        if (declarations == null) return
+        for (declaration in declarations) {
+            var found = -1
+            var i = 0
+            while (i < names.size && found < 0) {
+                if (names[i] == declaration.name) found = i
+                i = i + 1
+            }
+            if (found >= 0) {
+                if (declaration.tokenized) values[found] = xmlCollapseSpaces(values[found])
+            } else if (declaration.hasDefault) {
+                if (names.size >= options.maxAttributes) {
+                    fail("too_many_attributes", "more than ${options.maxAttributes} attributes")
+                    return
+                }
+                names.append(declaration.name)
+                values.append(declaration.defaultValue)
+            }
+        }
+        return
+    }
+
+    // [23] XMLDecl, when the document starts with one.
+    fun parseXmlDeclaration(): bool {
+        if (!looking("<?xml") || src.size < 6 || !xmlIsSpace(src[5])) return true
+        pos = 5
+        if (!requireSpace()) return false
+        if (!looking("version")) return fail("invalid_declaration", "the XML declaration needs a version first")
+        pos = pos + 7
+        val versionValue = readPseudoValue()
+        if (error != null) return false
+        if (!xmlVersionValid(versionValue)) return fail("invalid_declaration", "bad XML version $versionValue")
+        version = versionValue
+        var spaced = skipSpace()
+        if (looking("encoding")) {
+            if (!spaced) return fail("expected_space", "expected whitespace before encoding")
+            pos = pos + 8
+            val encodingValue = readPseudoValue()
+            if (error != null) return false
+            if (!xmlEncodingNameValid(encodingValue)) return fail("invalid_declaration", "bad encoding name $encodingValue")
+            declaredEncoding = encodingValue
+            spaced = skipSpace()
+        }
+        if (looking("standalone")) {
+            if (!spaced) return fail("expected_space", "expected whitespace before standalone")
+            pos = pos + 10
+            val standaloneValue = readPseudoValue()
+            if (error != null) return false
+            if (standaloneValue != "yes" && standaloneValue != "no") {
+                return fail("invalid_declaration", "standalone must be yes or no")
+            }
+            standalone = standaloneValue
+            skipSpace()
+        }
+        if (!looking("?>")) return fail("invalid_declaration", "the XML declaration must end with ?>")
+        pos = pos + 2
+        true
+    }
+
+    fun readPseudoValue(): string {
+        skipSpace()
+        if (!expectByte(EQUALS, "= in the XML declaration")) return ""
+        skipSpace()
+        val end = readLiteralEnd()
+        if (end < 0) return ""
+        val value = src.slice(pos + 1, end)
+        pos = end + 1
+        value
+    }
+
+    // [28] doctypedecl
+    fun parseDoctype(): bool {
+        doctypeSeen = true
+        pos = pos + 9
+        if (!requireSpace()) return false
+        val name = readName()
+        if (name.size == 0) return false
+        val spaced = skipSpace()
+        var publicId = ""
+        var systemId = ""
+        if (looking("SYSTEM") || looking("PUBLIC")) {
+            if (!spaced) return fail("expected_space", "expected whitespace before an external ID")
+            externalSubset = true
+            if (!readExternalId(false)) return false
+            publicId = lastPublicId
+            systemId = lastSystemId
+            skipSpace()
+        }
+        doctype = XmlDoctype(name, publicId, systemId)
+        if (!atEnd() && src[pos] == LBRACKET) {
+            pos = pos + 1
+            if (!parseInternalSubset()) return false
+            skipSpace()
+        }
+        expectByte(GT, "> to end the DOCTYPE")
+    }
+
+    // [75] ExternalID, or [83] PublicID when `publicOnlyAllowed`. The cursor is
+    // on SYSTEM or PUBLIC.
+    fun readExternalId(publicOnlyAllowed: bool): bool {
+        lastPublicId = ""
+        lastSystemId = ""
+        if (looking("PUBLIC")) {
+            pos = pos + 6
+            if (!requireSpace()) return false
+            val end = readLiteralEnd()
+            if (end < 0) return false
+            var i = pos + 1
+            while (i < end) {
+                if (!xmlIsPubidChar(src[i])) {
+                    pos = i
+                    return fail("invalid_public_id", "a character not allowed in a public ID")
+                }
+                i = i + 1
+            }
+            lastPublicId = src.slice(pos + 1, end)
+            pos = end + 1
+            val spaced = skipSpace()
+            if (!atEnd() && (src[pos] == QUOTE || src[pos] == APOS)) {
+                if (!spaced) return fail("expected_space", "expected whitespace before a system ID")
+            } else {
+                if (publicOnlyAllowed) return true
+                return fail("expected_quote", "PUBLIC needs a system ID here")
+            }
+        } else if (looking("SYSTEM")) {
+            pos = pos + 6
+            if (!requireSpace()) return false
+        } else {
+            return fail("unexpected_token", "expected SYSTEM or PUBLIC")
+        }
+        val end = readLiteralEnd()
+        if (end < 0) return false
+        lastSystemId = src.slice(pos + 1, end)
+        pos = end + 1
+        true
+    }
+
+    // [28b] intSubset, up to and past the closing ]. Parameter entities become
+    // input frames, so the same loop reads their declarations.
+    fun parseInternalSubset(): bool {
+        while (true) {
+            skipSpace()
+            if (atEnd()) {
+                if (frameText.size == 0) return fail("unexpected_end", "an unfinished DOCTYPE")
+                popFrame()
+            } else {
+                val b = src[pos]
+                if (b == RBRACKET) {
+                    if (frameText.size > 0) return fail("unexpected_token", "] inside a parameter entity")
+                    pos = pos + 1
+                    return true
+                }
+                if (b == PERCENT) {
+                    if (!readParameterReference()) return false
+                } else if (b != LT) {
+                    return fail("unexpected_token", "expected a declaration in the DTD")
+                } else if (looking("<!ELEMENT")) {
+                    if (!parseElementDeclaration()) return false
+                } else if (looking("<!ATTLIST")) {
+                    if (!parseAttlistDeclaration()) return false
+                } else if (looking("<!ENTITY")) {
+                    if (!parseEntityDeclaration()) return false
+                } else if (looking("<!NOTATION")) {
+                    if (!parseNotationDeclaration()) return false
+                } else if (looking("<!--")) {
+                    if (readComment() == null) return false
+                } else if (looking("<?")) {
+                    if (readProcessingInstruction() == null) return false
+                } else {
+                    return fail("unexpected_token", "unknown declaration in the DTD")
+                }
+            }
+        }
+        true
+    }
+
+    fun readParameterReference(): bool {
+        pos = pos + 1
+        val name = readName()
+        if (name.size == 0) return false
+        if (!expectByte(SEMI, "; after a parameter entity's name")) return false
+        parameterReferenceSeen = true
+        val declared = parameterEntities.get(name)
+        if (declared == null) {
+            if (standalone == "yes") return fail("undeclared_entity", "parameter entity $name is not declared")
+            stopDeclarations = true
+            return true
+        }
+        if (declared.external) {
+            stopDeclarations = true
+            return true
+        }
+        val key = "%$name"
+        if (xmlListHas(frameName, key)) return fail("entity_recursion", "parameter entity $name refers to itself")
+        if (!chargeEntity(name, declared.value.size)) return false
+        pushFrame(key, declared.value, 0, pos)
+        true
+    }
+
+    // [45] elementdecl
+    fun parseElementDeclaration(): bool {
+        pos = pos + 9
+        if (!requireSpace()) return false
+        if (readName().size == 0) return false
+        if (!requireSpace()) return false
+        if (looking("EMPTY")) {
+            pos = pos + 5
+        } else if (looking("ANY")) {
+            pos = pos + 3
+        } else if (!atEnd() && src[pos] == LPAREN) {
+            pos = pos + 1
+            skipSpace()
+            if (looking("#PCDATA")) {
+                if (!parseMixedContent()) return false
+            } else {
+                if (!parseContentGroup(1)) return false
+                readOccurrence()
+            }
+        } else {
+            return fail("unexpected_token", "expected a content model")
+        }
+        skipSpace()
+        expectByte(GT, "> to end the element declaration")
+    }
+
+    // [51] Mixed, with the cursor on #PCDATA.
+    fun parseMixedContent(): bool {
+        pos = pos + 7
+        var names = 0
+        while (true) {
+            skipSpace()
+            if (atEnd()) return fail("unexpected_end", "an unfinished content model")
+            val b = src[pos]
+            if (b == RPAREN) {
+                pos = pos + 1
+                if (!atEnd() && src[pos] == 42) {
+                    pos = pos + 1
+                    return true
+                }
+                if (names > 0) return fail("unexpected_token", "mixed content with names needs )*")
+                return true
+            }
+            if (b != PIPE) return fail("unexpected_token", "expected | or ) in mixed content")
+            pos = pos + 1
+            skipSpace()
+            if (readName().size == 0) return false
+            names = names + 1
+        }
+        true
+    }
+
+    // [49] choice or [50] seq, with the cursor past the ( and its whitespace.
+    fun parseContentGroup(depth: int): bool {
+        if (depth > options.maxDepth) return fail("too_deep", "a content model nests deeper than ${options.maxDepth}")
+        var separator = 0
+        while (true) {
+            skipSpace()
+            if (atEnd()) return fail("unexpected_end", "an unfinished content model")
+            if (src[pos] == LPAREN) {
+                pos = pos + 1
+                if (!parseContentGroup(depth + 1)) return false
+            } else {
+                if (readName().size == 0) return false
+            }
+            readOccurrence()
+            skipSpace()
+            if (atEnd()) return fail("unexpected_end", "an unfinished content model")
+            val b = src[pos]
+            if (b == RPAREN) {
+                pos = pos + 1
+                return true
+            }
+            if (b != PIPE && b != COMMA) return fail("unexpected_token", "expected , | or ) in a content model")
+            if (separator != 0 && separator != b) return fail("unexpected_token", "a group can't mix , and |")
+            separator = b
+            pos = pos + 1
+        }
+        true
+    }
+
+    fun readOccurrence(): void {
+        if (!atEnd() && (src[pos] == 63 || src[pos] == 42 || src[pos] == 43)) pos = pos + 1
+        return
+    }
+
+    // [52] AttlistDecl
+    fun parseAttlistDeclaration(): bool {
+        pos = pos + 9
+        if (!requireSpace()) return false
+        val element = readName()
+        if (element.size == 0) return false
+        while (true) {
+            val spaced = skipSpace()
+            if (atEnd()) return fail("unexpected_end", "an unfinished attribute list")
+            if (src[pos] == GT) {
+                pos = pos + 1
+                return true
+            }
+            if (!spaced) return fail("expected_space", "expected whitespace before an attribute")
+            val name = readName()
+            if (name.size == 0) return false
+            if (!requireSpace()) return false
+            var tokenized = true
+            if (looking("CDATA")) {
+                tokenized = false
+                pos = pos + 5
+            } else if (looking("IDREFS") || looking("NMTOKENS") || looking("ENTITIES")) {
+                pos = pos + (if (looking("IDREFS")) 6 else 8)
+            } else if (looking("IDREF") || looking("ENTITY")) {
+                pos = pos + (if (looking("IDREF")) 5 else 6)
+            } else if (looking("ID")) {
+                pos = pos + 2
+            } else if (looking("NMTOKEN")) {
+                pos = pos + 7
+            } else if (looking("NOTATION")) {
+                pos = pos + 8
+                if (!requireSpace()) return false
+                if (!expectByte(LPAREN, "( after NOTATION")) return false
+                if (!readEnumeration(false)) return false
+            } else if (!atEnd() && src[pos] == LPAREN) {
+                pos = pos + 1
+                if (!readEnumeration(true)) return false
+            } else {
+                return fail("unexpected_token", "expected an attribute type")
+            }
+            if (!requireSpace()) return false
+            var hasDefault = false
+            var value = ""
+            if (looking("#REQUIRED")) {
+                pos = pos + 9
+            } else if (looking("#IMPLIED")) {
+                pos = pos + 8
+            } else {
+                if (looking("#FIXED")) {
+                    pos = pos + 6
+                    if (!requireSpace()) return false
+                }
+                value = readAttributeValue()
+                if (error != null) return false
+                hasDefault = true
+            }
+            if (tokenized) value = xmlCollapseSpaces(value)
+            if (!stopDeclarations) {
+                if (!attlists.has(element)) attlists.set(element, array<XmlAttributeDeclaration>())
+                val declarations = attlists.get(element)
+                if (declarations != null) {
+                    var known = false
+                    for (declaration in declarations) {
+                        if (declaration.name == name) known = true
+                    }
+                    if (!known && declarations.size >= options.maxAttributes) {
+                        return fail("too_many_attributes", "more than ${options.maxAttributes} attributes declared on $element")
+                    }
+                    // The first declaration of an attribute is the binding one.
+                    if (!known) attlists.set(element, xmlWithDeclaration(declarations, XmlAttributeDeclaration(name, tokenized, hasDefault, value)))
+                }
+            }
+        }
+        true
+    }
+
+    // [59] Enumeration or the list of [58] NotationType, past the (. Enumerated
+    // values are Nmtokens, notation names are Names.
+    fun readEnumeration(tokens: bool): bool {
+        while (true) {
+            skipSpace()
+            if (tokens) {
+                val begin = pos
+                while (!atEnd() && xmlIsNameChar(xmlCodePointAt(src, pos))) pos = pos + xmlUtf8Size(src[pos])
+                if (pos == begin) return fail("expected_name", "expected a name token")
+            } else if (readName().size == 0) {
+                return false
+            }
+            skipSpace()
+            if (atEnd()) return fail("unexpected_end", "an unfinished enumeration")
+            if (src[pos] == RPAREN) {
+                pos = pos + 1
+                return true
+            }
+            if (!expectByte(PIPE, "| or ) in an enumeration")) return false
+        }
+        true
+    }
+
+    // [70] EntityDecl
+    fun parseEntityDeclaration(): bool {
+        pos = pos + 8
+        if (!requireSpace()) return false
+        var parameter = false
+        if (!atEnd() && src[pos] == PERCENT) {
+            parameter = true
+            pos = pos + 1
+            if (!requireSpace()) return false
+        }
+        val name = readDeclaredName()
+        if (name.size == 0) return false
+        if (!requireSpace()) return false
+        var declaration = XmlEntityDeclaration("", true, false)
+        if (!atEnd() && (src[pos] == QUOTE || src[pos] == APOS)) {
+            val value = readEntityValue()
+            if (error != null) return false
+            declaration = XmlEntityDeclaration(value, false, false)
+            skipSpace()
+        } else {
+            if (!readExternalId(false)) return false
+            val spaced = skipSpace()
+            var unparsed = false
+            if (looking("NDATA")) {
+                if (parameter) return fail("unexpected_token", "a parameter entity can't have NDATA")
+                if (!spaced) return fail("expected_space", "expected whitespace before NDATA")
+                pos = pos + 5
+                if (!requireSpace()) return false
+                if (readName().size == 0) return false
+                unparsed = true
+                skipSpace()
+            }
+            declaration = XmlEntityDeclaration("", true, unparsed)
+        }
+        if (!expectByte(GT, "> to end the entity declaration")) return false
+        if (!stopDeclarations) {
+            // The first declaration of an entity is the binding one.
+            val table = if (parameter) parameterEntities else generalEntities
+            if (!table.has(name)) table.set(name, declaration)
+        }
+        true
+    }
+
+    // [9] EntityValue, giving the replacement text of XML 1.0 section 4.5:
+    // character references expanded, general entity references left alone.
+    fun readEntityValue(): string {
+        val end = readLiteralEnd()
+        if (end < 0) return ""
+        val out = byteBuffer()
+        var i = pos + 1
+        var run = i
+        while (i < end) {
+            val b = src[i]
+            if (b == PERCENT) {
+                pos = i
+                fail("parameter_reference_in_markup", "a parameter entity reference inside a declaration")
+                return ""
+            }
+            if (b == AMP) {
+                out.appendText(sourceText(run, i))
+                pos = i
+                // The reference must finish inside the literal.
+                if (i + 1 < end && src[i + 1] == HASH) {
+                    val cp = readCharRef(src, i)
+                    if (cp < 0) return ""
+                    if (refEnd > end) {
+                        fail("invalid_reference", "an unfinished character reference")
+                        return ""
+                    }
+                    out.appendText(utf8Encode(cp))
+                    i = refEnd
+                    run = i
+                } else {
+                    val name = readRefName(src, i)
+                    if (name.size == 0) return ""
+                    if (refEnd > end) {
+                        fail("invalid_reference", "an unfinished reference")
+                        return ""
+                    }
+                    i = refEnd
+                    out.appendText(sourceText(pos, i))
+                    run = i
+                }
+            } else {
+                i = i + 1
+            }
+        }
+        out.appendText(sourceText(run, end))
+        pos = end + 1
+        out.toText()
+    }
+
+    // [82] NotationDecl
+    fun parseNotationDeclaration(): bool {
+        pos = pos + 10
+        if (!requireSpace()) return false
+        if (readDeclaredName().size == 0) return false
+        if (!requireSpace()) return false
+        if (!readExternalId(true)) return false
+        skipSpace()
+        expectByte(GT, "> to end the notation declaration")
+    }
+}
+
+fun xmlWithDeclaration(declarations: array<XmlAttributeDeclaration>, added: XmlAttributeDeclaration): array<XmlAttributeDeclaration> {
+    val all: array<XmlAttributeDeclaration> = []
+    for (declaration in declarations) all.append(declaration)
+    all.append(added)
+    all
+}
+
+fun xmlListHas(list: array<string>, name: string): bool {
+    for (candidate in list) {
+        if (candidate == name) return true
+    }
+    false
+}
+
+fun xmlPredefinedEntity(name: string): string = when (name) {
+    "lt" -> "<"
+    "gt" -> ">"
+    "amp" -> "&"
+    "apos" -> "'"
+    "quot" -> "\""
+    else -> ""
+}
+
+// [26] VersionNum: 1.x, which section 2.8 says to read as this version.
+fun xmlVersionValid(version: string): bool {
+    if (version.size < 3 || !version.startsWith("1.")) return false
+    var i = 2
+    while (i < version.size) {
+        if (version[i] < 48 || version[i] > 57) return false
+        i = i + 1
+    }
+    true
+}
+
+// [13] PubidChar
+fun xmlIsPubidChar(b: int): bool =
+    b == 32 || b == 13 || b == 10 || (b >= 97 && b <= 122) || (b >= 65 && b <= 90) ||
+    (b >= 48 && b <= 57) || b == 45 || b == 39 || b == 40 || b == 41 || b == 43 ||
+    b == 44 || b == 46 || b == 47 || b == 58 || b == 61 || b == 63 || b == 59 ||
+    b == 33 || b == 42 || b == 35 || b == 64 || b == 36 || b == 95 || b == 37
+
+// Attribute normalization for tokenized types: trims spaces and collapses runs.
+fun xmlCollapseSpaces(value: string): string {
+    if (value.indexOf(" ") < 0) return value
+    val parts: array<string> = []
+    for (part in value.split(" ")) {
+        if (part.size > 0) parts.append(part)
+    }
+    textJoin(parts, " ")
+}
+
+// A reader over a document's bytes, encoded as its declaration says. A problem
+// with the source comes as an error event from next().
+fun xmlReader(source: string, options: XmlOptions = XmlOptions()): XmlReader {
+    val decoded = if (source.size > options.maxBytes) XmlDecoded("", "too_large", 0, 0) else xmlDecodeSource(source)
+    val reader = XmlReader(
+        options, decoded.text, 0, decoded.bias,
+        [], [], [], [], [], [], [], [], [],
+        Map(), Map(), Map(),
+        byteBuffer()
+    )
+    if (decoded.errorCode.size > 0) {
+        reader.pos = decoded.errorOffset
+        reader.fail(decoded.errorCode, when (decoded.errorCode) {
+            "too_large" -> "the document is larger than ${options.maxBytes} bytes"
+            "unsupported_encoding" -> "this parser can't read the declared encoding"
+            "encoding_mismatch" -> "the byte order mark and the declared encoding disagree"
+            else -> "the bytes aren't valid in the declared encoding"
+        })
+        return reader
+    }
+    val invalid = xmlFirstInvalidChar(decoded.text)
+    if (invalid >= 0) {
+        reader.pos = invalid
+        reader.fail("invalid_char", "invalid UTF-8 or a character XML forbids")
+    }
+    reader
+}

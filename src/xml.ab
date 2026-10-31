@@ -1,5 +1,8 @@
 import "chars.ab"
 import "encoding.ab"
 import "writer.ab"
+import "tree.ab"
+import "reader.ab"
+import "parse.ab"
 
 fun xmlPackageVersion(): string = "0.1.0"

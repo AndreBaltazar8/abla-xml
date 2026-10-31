@@ -1,0 +1,344 @@
+import "../src/xml.ab"
+import "abla/test"
+import "abla/text"
+import "abla/bytes"
+
+val dtd = XmlOptions(allowDtd = true)
+
+fun rejects(source: string, code: string, options: XmlOptions = XmlOptions()): void {
+    val result = xmlParse(source, options)
+    val problem = result.error
+    expect(!result.succeeded, "rejects [$source]")
+    expectEqual(if (problem != null) problem.code else "", code, "code for [$source]")
+    return
+}
+
+fun root(source: string, options: XmlOptions = XmlOptions()): XmlElement {
+    val result = xmlParse(source, options)
+    val problem = result.error
+    if (problem != null) {
+        expect(false, "parses [$source]: ${problem.code} ${problem.message}")
+    }
+    val document = result.document
+    if (document != null) document.root else XmlElement("", "", "", "", [], [], 0, 0, 0)
+}
+
+fun at(source: string, line: int, column: int, offset: int): void {
+    val problem = xmlParse(source).error
+    if (problem != null) {
+        expectEqual(problem.line, line, "line of error in [$source]")
+        expectEqual(problem.column, column, "column of error in [$source]")
+        expectEqual(problem.byteOffset, offset, "offset of error in [$source]")
+    } else {
+        expect(false, "should reject [$source]")
+    }
+    return
+}
+
+fun laughs(levels: int): string {
+    val out = byteBuffer()
+    out.appendText("<!DOCTYPE a [<!ENTITY l0 'hahahahaha'>")
+    var i = 1
+    while (i <= levels) {
+        out.appendText("<!ENTITY l$i '")
+        var j = 0
+        while (j < 10) {
+            out.appendText("&l${i - 1};")
+            j = j + 1
+        }
+        out.appendText("'>")
+        i = i + 1
+    }
+    out.appendText("]><a>&l$levels;</a>")
+    out.toText()
+}
+
+fun main: int {
+    // Trees
+    val tree = root("<?xml version=\"1.0\"?>\n<!-- c --><r xmlns=\"urn:d\" xmlns:p=\"urn:p\" a=\"1\" p:a=\"2\" xml:lang=\"pt\">t1<p:c k=\"v\">in</p:c>&lt;<![CDATA[<x>&amp;]]><?pi d?><!--n--><e/></r>")
+    expectEqual(tree.name, "r", "name")
+    expectEqual(tree.namespaceUri, "urn:d", "default namespace")
+    expectEqual(tree.attributeValue("a"), "1", "unprefixed attribute has no namespace")
+    expectEqual(tree.attributeValue("a", "", "urn:p"), "2", "prefixed attribute")
+    expectEqual(tree.attributeValue("lang", "", xmlNamespaceXml), "pt", "xml prefix")
+    expectEqual(tree.attributeValue("missing", "dflt"), "dflt", "fallback")
+    expectEqual(tree.childText("c"), "in", "childText")
+    val c = tree.child("c", "urn:p")
+    expect(c != null, "child by namespace")
+    expect(tree.child("c", "urn:other") == null, "child in another namespace")
+    expectEqual(tree.elements().size, 2, "elements")
+    expectEqual(tree.text(), "t1in<<x>&amp;", "text in document order")
+    expectEqual(tree.children.size, 7, "children: text, element, text, cdata, pi, comment, element")
+    when (tree.children[3]) {
+        is XmlText -> expect(true, "cdata node")
+        else -> expect(false, "cdata node")
+    }
+    val document = xmlParse("<?xml version=\"1.1\" encoding=\"utf-8\" standalone=\"yes\"?><!--a--><?b c?><r/><!--d-->").document
+    if (document != null) {
+        expectEqual(document.version, "1.1", "version")
+        expectEqual(document.encoding, "utf-8", "encoding")
+        expectEqual(document.standalone, "yes", "standalone")
+        expectEqual(document.prolog.size, 2, "prolog")
+        expectEqual(document.epilog.size, 1, "epilog")
+    } else {
+        expect(false, "document")
+    }
+
+    // Pull events
+    val reader = xmlReader("<a x='1'>t<b/></a>")
+    var kinds = ""
+    while (true) {
+        val event = reader.next()
+        kinds = "$kinds${event.kind}"
+        if (event.kind == xmlEventEndOfDocument || event.kind == xmlEventError) break
+    }
+    expectEqual(kinds, "131228", "event kinds")
+    expectEqual(reader.next().kind, xmlEventEndOfDocument, "end stays")
+    val broken = xmlReader("<a><b></a>")
+    while (broken.next().kind != xmlEventError) {}
+    expectEqual(broken.next().kind, xmlEventError, "error stays")
+
+    // Positions
+    at("<a>\n  <b>\n</a>", 3, 1, 10)
+    at("<a>\r\n<b>\r</a>", 3, 1, 9)
+    at("<a>café &bad;</a>", 1, 9, 9)
+    at("<a b='1' b='2'/>", 1, 1, 0)
+    at("<a b='x<y'/>", 1, 8, 7)
+    at("<a>\x01</a>", 1, 4, 3)
+    at("\xEF\xBB\xBF<a>\n&</a>", 2, 1, 7)
+    val positioned = root("<a>\n <b/>\n  <c/></a>")
+    val b = positioned.child("b")
+    if (b != null) {
+        expectEqual(b.line, 2, "element line")
+        expectEqual(b.column, 2, "element column")
+        expectEqual(b.byteOffset, 5, "element offset")
+    }
+    val c2 = positioned.child("c")
+    if (c2 != null) expectEqual(c2.line, 3, "second element line")
+    val inEntity = xmlParse("<!DOCTYPE a [<!ENTITY e '<b>'>]>\n<a>\n &e;</a>", dtd).error
+    if (inEntity != null) {
+        expectEqual(inEntity.line, 3, "error in an entity is at its reference")
+        expectEqual(inEntity.entity, "&e", "and names it")
+    } else {
+        expect(false, "unbalanced entity")
+    }
+
+    // Line ends and text
+    expectEqual(root("<a>x\r\ny\rz\n</a>").text(), "x\ny\nz\n", "line ends in text")
+    expectEqual(root("<a><![CDATA[x\r\ny]]></a>").text(), "x\ny", "line ends in CDATA")
+    expectEqual(root("<a>&#13;&#xD;</a>").text(), "\r\r", "references keep CR")
+    expectEqual(root("<a b='x\r\ny\tz\nw'/>").attributeValue("b"), "x y z w", "attribute whitespace")
+    expectEqual(root("<a b='&#10;&#9;&#13;'/>").attributeValue("b"), "\n\t\r", "attribute references kept")
+    expectEqual(root("<a>&#x1F600;&#233;</a>").text(), "\u{1F600}é", "character references")
+    expectEqual(root("<a>&lt;&gt;&amp;&apos;&quot;</a>").text(), "<>&'\"", "predefined entities")
+    expectEqual(root("<a>]]</a>").text(), "]]", "lone brackets")
+    rejects("<a>]]></a>", "cdata_end_in_text")
+    rejects("<a>&#0;</a>", "invalid_char")
+    rejects("<a>&#xD800;</a>", "invalid_char")
+    rejects("<a>&#x110000;</a>", "invalid_char")
+    rejects("<a>&#99999999999999999999999999;</a>", "invalid_char")
+    rejects("<a>&#;</a>", "invalid_reference")
+    rejects("<a>&#xZ;</a>", "invalid_reference")
+    rejects("<a>&</a>", "invalid_reference")
+    rejects("<a>&b</a>", "invalid_reference")
+
+    // Structure
+    rejects("", "missing_root")
+    rejects("  ", "missing_root")
+    rejects("<!--c-->", "missing_root")
+    rejects("text", "content_outside_root")
+    rejects("<a/>t", "content_outside_root")
+    rejects("<a/><b/>", "multiple_roots")
+    rejects("<a>", "unexpected_end")
+    rejects("<a", "unexpected_end")
+    rejects("<a b", "unexpected_token")
+    rejects("<a></b>", "tag_mismatch")
+    rejects("<a b=1/>", "expected_quote")
+    rejects("<a b='1'c='2'/>", "expected_space")
+    rejects("<a b='<'/>", "lt_in_attribute")
+    rejects("<a b='1' b='2'/>", "duplicate_attribute")
+    rejects(" <?xml version='1.0'?><a/>", "reserved_target")
+    rejects("<?xml?><a/>", "reserved_target")
+    rejects("<?xml encoding='UTF-8'?><a/>", "invalid_declaration")
+    rejects("<?xml version='2.0'?><a/>", "invalid_declaration")
+    rejects("<?xml version='1.0' standalone='maybe'?><a/>", "invalid_declaration")
+    rejects("<?xml version='1.0' standalone='yes' encoding='UTF-8'?><a/>", "invalid_declaration")
+    rejects("<?xml version='1.0' encoding='a b'?><a/>", "invalid_declaration")
+    rejects("<a><!-- -- --></a>", "invalid_comment")
+    rejects("<a><!-- ---></a>", "invalid_comment")
+    rejects("<a><!-- </a>", "unexpected_end")
+    rejects("<a><![CDATA[</a>", "unexpected_end")
+    rejects("<a><?pi </a>", "unexpected_end")
+    rejects("<a><?xMl a?></a>", "reserved_target")
+    rejects("<a><!FOO></a>", "unexpected_token")
+    rejects("<1a/>", "expected_name")
+
+    // Namespaces
+    rejects("<p:a/>", "undeclared_prefix")
+    rejects("<a p:b='1'/>", "undeclared_prefix")
+    rejects("<a xmlns:p='urn:x' xmlns:q='urn:x' p:b='1' q:b='2'/>", "duplicate_attribute")
+    rejects("<a:b:c xmlns:a='u'/>", "invalid_qname")
+    rejects("<a xmlns:p=''/>", "empty_namespace_prefix")
+    rejects("<a xmlns:xmlns='u'/>", "reserved_namespace_prefix")
+    rejects("<a xmlns:xml='u'/>", "reserved_namespace_prefix")
+    rejects("<a xmlns:p='http://www.w3.org/XML/1998/namespace'/>", "reserved_namespace_uri")
+    rejects("<a xmlns='http://www.w3.org/2000/xmlns/'/>", "reserved_namespace_uri")
+    rejects("<a><?p:q?></a>", "invalid_qname")
+    val noNamespaces = XmlOptions(namespaces = false)
+    expectEqual(root("<a:b:c p:d='1'/>", noNamespaces).name, "a:b:c", "namespaces off")
+    expectEqual(root("<a:b:c p:d='1'/>", noNamespaces).localName, "a:b:c", "namespaces off local name")
+    val scoped = root("<a xmlns='u1' xmlns:p='u2'><b xmlns=''><p:c xmlns:p='u3'/><p:d xmlns:q='u4'/></b><e/></a>")
+    val scopedB = scoped.child("b")
+    if (scopedB != null) {
+        expectEqual(scopedB.namespaceUri, "", "default undeclared")
+        expect(scopedB.child("c", "u3") != null, "rebound prefix")
+        expect(scopedB.child("d", "u2") != null, "binding back in scope")
+    } else {
+        expect(false, "scoped b")
+    }
+    expect(scoped.child("e", "u1") != null, "default back in scope")
+
+    // Encodings
+    expectEqual(root("\xEF\xBB\xBF<a>é</a>").text(), "é", "UTF-8 byte order mark")
+    expectEqual(root("<?xml version='1.0' encoding='ISO-8859-1'?><a>\xE9</a>").text(), "é", "latin-1")
+    expectEqual(root("<?xml version='1.0' encoding='windows-1252'?><a>\x80\xE9</a>").text(), "€é", "windows-1252")
+    expectEqual(root("<?xml version='1.0' encoding='US-ASCII'?><a>x</a>").text(), "x", "ascii")
+    expectEqual(root("\xFF\xFE<\x00a\x00>\x00\xE9\x00\x3D\xD8\x00\xDE<\x00/\x00a\x00>\x00").text(), "é\u{1F600}", "UTF-16 little-endian with a surrogate pair")
+    expectEqual(root("\xFE\xFF\x00<\x00a\x00>\x00\xE9\x00<\x00/\x00a\x00>").text(), "é", "UTF-16 big-endian")
+    rejects("<?xml version='1.0' encoding='US-ASCII'?><a>\xC3\xA9</a>", "invalid_encoding")
+    rejects("<?xml version='1.0' encoding='windows-1252'?><a>\x81</a>", "invalid_encoding")
+    rejects("<?xml version='1.0' encoding='EUC-JP'?><a/>", "unsupported_encoding")
+    rejects("<?xml version='1.0' encoding='UTF-16'?><a/>", "encoding_mismatch")
+    rejects("\xEF\xBB\xBF<?xml version='1.0' encoding='ISO-8859-1'?><a/>", "encoding_mismatch")
+    rejects("\xFF\xFE<\x00a", "invalid_encoding")
+    rejects("<a>\xFF</a>", "invalid_char")
+    rejects("<a>\xC0\x80</a>", "invalid_char")
+    rejects("<a>\xED\xA0\x80</a>", "invalid_char")
+    rejects("<a>\xEF\xBF\xBF</a>", "invalid_char")
+    rejects("<a>\xF4\x90\x80\x80</a>", "invalid_char")
+
+    // DTDs are refused by default
+    rejects("<!DOCTYPE a><a/>", "dtd_forbidden")
+    rejects("<!DOCTYPE a [<!ENTITY e 'x'>]><a>&e;</a>", "dtd_forbidden")
+    rejects("<!DOCTYPE a SYSTEM 'file:///etc/passwd'><a/>", "dtd_forbidden")
+    rejects("<a>&undeclared;</a>", "undeclared_entity")
+
+    // With a DTD allowed: internal entities and defaults
+    expectEqual(root("<!DOCTYPE a [<!ENTITY e 'x&f;'><!ENTITY f 'y'>]><a>&e;</a>", dtd).text(), "xy", "nested entities")
+    expectEqual(root("<!DOCTYPE a [<!ENTITY e '<b>t</b>'>]><a>&e;</a>", dtd).childText("b"), "t", "markup in an entity")
+    expectEqual(root("<!DOCTYPE a [<!ENTITY e 'first'><!ENTITY e 'second'>]><a>&e;</a>", dtd).text(), "first", "first declaration binds")
+    val withDefaults = root("<!DOCTYPE a [<!ATTLIST a d CDATA 'dv' t NMTOKENS ' x  y ' s CDATA 'dv2'>]><a t='  p   q ' s='own'/>", dtd)
+    expectEqual(withDefaults.attributeValue("d"), "dv", "attribute default")
+    expectEqual(withDefaults.attributeValue("t"), "p q", "tokenized value collapses")
+    expectEqual(withDefaults.attributeValue("s"), "own", "specified beats default")
+    val defaultAttribute = withDefaults.attribute("d")
+    if (defaultAttribute != null) expect(!defaultAttribute.specified, "default is marked")
+    expectEqual(root("<!DOCTYPE a [<!ATTLIST a xmlns CDATA 'urn:def'>]><a/>", dtd).namespaceUri, "urn:def", "namespace from a default")
+    expectEqual(root("<!DOCTYPE a [<!ENTITY % p '<!ENTITY e \"via\">'>%p;]><a>&e;</a>", dtd).text(), "via", "internal parameter entity")
+    rejects("<!DOCTYPE a [<!ENTITY e '<b>'>]><a>&e;</b></a>", "entity_unbalanced", dtd)
+    rejects("<!DOCTYPE a [<!ENTITY e '</a>'>]><a>&e;", "entity_unbalanced", dtd)
+    rejects("<!DOCTYPE a [<!ENTITY e 'a<'>]><a b='&e;'/>", "lt_in_attribute", dtd)
+    rejects("<!DOCTYPE a [<!ENTITY e '&e;'>]><a>&e;</a>", "entity_recursion", dtd)
+    rejects("<!DOCTYPE a [<!ENTITY e '&f;'><!ENTITY f '&e;'>]><a>&e;</a>", "entity_recursion", dtd)
+    rejects("<!DOCTYPE a [<!ENTITY e '&f;'><!ENTITY f '&e;'>]><a b='&e;'/>", "entity_recursion", dtd)
+    rejects("<!DOCTYPE a [<!ENTITY % p '%p;'>]><a/>", "parameter_reference_in_markup", dtd)
+    rejects("<!DOCTYPE a [<!ENTITY % p '&#37;p;'>%p;]><a/>", "entity_recursion", dtd)
+    rejects("<!DOCTYPE a [<!ENTITY e SYSTEM 'x' NDATA n>]><a>&e;</a>", "unparsed_entity", dtd)
+    rejects("<!DOCTYPE a [<!ENTITY e SYSTEM 'x'>]><a b='&e;'/>", "external_entity_in_attribute", dtd)
+    rejects("<!DOCTYPE a><!DOCTYPE a><a/>", "misplaced_doctype", dtd)
+    rejects("<a/><!DOCTYPE a>", "misplaced_doctype", dtd)
+    rejects("<!DOCTYPE a [<![INCLUDE[]]>]><a/>", "unexpected_token", dtd)
+
+    // External entities are reported, never read
+    val external = xmlParse("<!DOCTYPE a [<!ENTITY e SYSTEM 'file:///etc/passwd'>]><a>x&e;y</a>", dtd)
+    val externalDocument = external.document
+    if (externalDocument != null) {
+        expectEqual(externalDocument.root.text(), "xy", "external entity content is absent")
+        expectEqual(externalDocument.skippedEntities, 1, "external entity is counted")
+        expectEqual(externalDocument.root.children.size, 3, "text, skipped, text")
+        when (externalDocument.root.children[1]) {
+            is XmlSkippedEntity -> expect(true, "skipped node")
+            else -> expect(false, "skipped node")
+        }
+    } else {
+        expect(false, "external entity document")
+    }
+    val externalSubset = xmlParse("<!DOCTYPE a SYSTEM 'http://example.invalid/x.dtd'><a>&fromSubset;</a>", dtd).document
+    if (externalSubset != null) {
+        expectEqual(externalSubset.skippedEntities, 1, "undeclared with an unread subset is skipped")
+        val type = externalSubset.doctype
+        if (type != null) expectEqual(type.systemId, "http://example.invalid/x.dtd", "doctype is reported")
+    } else {
+        expect(false, "external subset document")
+    }
+    rejects("<?xml version='1.0' standalone='yes'?><!DOCTYPE a SYSTEM 'x'><a>&e;</a>", "undeclared_entity", dtd)
+    expectEqual(root("<!DOCTYPE a [<!ENTITY % x SYSTEM 'x'>%x;<!ENTITY e 'late'>]><a b='1'>t</a>", dtd).text(), "t", "after an unread parameter entity")
+    val late = xmlParse("<!DOCTYPE a [<!ENTITY % x SYSTEM 'x'>%x;<!ENTITY e 'late'>]><a>&e;</a>", dtd).document
+    if (late != null) expectEqual(late.skippedEntities, 1, "declarations after it aren't used")
+
+    // Entity expansion attacks
+    rejects(laughs(9), "entity_limit", dtd)
+    rejects(laughs(3).replace("<a>&l3;</a>", "<a b='&l3;&l3;&l3;&l3;&l3;&l3;&l3;&l3;'/>"), "entity_limit", XmlOptions(allowDtd = true, maxEntityBytes = 1000))
+    val quadratic = "<!DOCTYPE a [<!ENTITY e '${"x".repeat(100000)}'>]><a>${"&e;".repeat(100)}</a>"
+    rejects(quadratic, "entity_limit", dtd)
+    rejects("<!DOCTYPE a [<!ENTITY e ''>]><a>${"&e;".repeat(5000)}</a>", "entity_limit", dtd)
+    var chain = "<!DOCTYPE a [<!ENTITY e0 'x'>"
+    var level = 1
+    while (level < 40) {
+        chain = "$chain<!ENTITY e$level '&e${level - 1};'>"
+        level = level + 1
+    }
+    rejects("$chain]><a>&e39;</a>", "entity_limit", dtd)
+    expectEqual(root(laughs(2), dtd).text().size, 1000, "ordinary entity use still works")
+
+    // Trees written back
+    val defaulted = xmlParse("<!DOCTYPE a [<!ATTLIST a d CDATA 'v'><!ENTITY e 'x'>]><a>&e;</a>", dtd).document
+    if (defaulted != null) {
+        val w = xmlWriter()
+        xmlWriteDocument(w, defaulted)
+        expectEqual(w.finish().text, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a d=\"v\">x</a>", "a tree writes without its DTD")
+    } else {
+        expect(false, "defaulted document")
+    }
+    val skipped = xmlParse("<!DOCTYPE a [<!ENTITY e SYSTEM 'x'>]><a>&e;</a>", dtd).document
+    if (skipped != null) {
+        val w = xmlWriter()
+        xmlWriteDocument(w, skipped)
+        expectEqual(w.finish().errorCode, "skipped_entity", "a tree missing content won't write")
+    } else {
+        expect(false, "skipped document")
+    }
+    expectEqual(root("<\u{10000}a b\u00B7='1'/>").name, "\u{10000}a", "fifth edition names")
+
+    // Other limits
+    rejects("<a>${"<a>".repeat(300)}", "too_deep")
+    rejects("<a/>", "too_large", XmlOptions(maxBytes = 3))
+    rejects("<a>x<b/>y</a>", "too_many_nodes", XmlOptions(maxNodes = 2))
+    rejects("<a b='1' c='2'/>", "too_many_attributes", XmlOptions(maxAttributes = 1))
+    rejects("<abc/>", "name_too_long", XmlOptions(maxNameBytes = 2))
+    rejects("<a>abc</a>", "value_too_long", XmlOptions(maxValueBytes = 2))
+    rejects("<a b='abc'/>", "value_too_long", XmlOptions(maxValueBytes = 2))
+    rejects("<a><!--abc--></a>", "value_too_long", XmlOptions(maxValueBytes = 2))
+    rejects("<a><?p abc?></a>", "value_too_long", XmlOptions(maxValueBytes = 2))
+    rejects("<a><![CDATA[abc]]></a>", "value_too_long", XmlOptions(maxValueBytes = 2))
+    rejects("<a xmlns:a='u' xmlns:b='u'/>", "too_many_namespaces", XmlOptions(maxNamespaces = 1))
+    rejects("<!DOCTYPE a [<!ELEMENT a ${"(".repeat(300)}b${")".repeat(300)}>]><a/>", "too_deep", dtd)
+    rejects("<!DOCTYPE a [<!ATTLIST a b CDATA #IMPLIED c CDATA #IMPLIED>]><a/>", "too_many_attributes", XmlOptions(allowDtd = true, maxAttributes = 1))
+
+    // Very deep documents are fine for the pull reader, which doesn't recurse.
+    val deepCount = 200000
+    val deep = xmlReader("<a>".repeat(deepCount) + "</a>".repeat(deepCount), XmlOptions(maxDepth = deepCount))
+    var events = 0
+    while (true) {
+        val event = deep.next()
+        if (event.kind == xmlEventEndOfDocument) break
+        if (event.kind == xmlEventError) {
+            expect(false, "deep document: ${event.value}")
+            break
+        }
+        events = events + 1
+    }
+    expectEqual(events, deepCount * 2, "deep document events")
+
+    testsPassed()
+}
