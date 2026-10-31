@@ -7,9 +7,11 @@
 // parse or give an error with a position inside it. Whatever parses must survive
 // writing the tree and parsing it again with the same meaning. With a dump
 // directory every 8th input is saved with its verdict without namespace rules, for
-// comparing with xmllint.
+// comparing with xmllint. Each input also goes through the chunked reader, which must
+// give the same events as the whole-string reader, however it is split.
 import "../src/xml.ab"
 import "../tests/support/generate.ab"
+import "../tests/support/compare.ab"
 import "abla/bytes"
 import "abla/fs"
 import "abla/io"
@@ -131,6 +133,9 @@ fun main: int {
         val accepted = check(source, withoutNamespaces, stats)
         check(source, tight, stats)
         check(source, XmlOptions(), stats)
+        val pieces = [1, 2, 3, 5, 8, 13, 64, 4096]
+        val difference = compareReaders(source, withDtd, pieces[random.below(pieces.size)])
+        if (difference != "") panic("the chunked reader differs: $difference")
         if (dump.size > 0 && i % 8 == 0) {
             Path("$dump/$i.xml").writeText(source)
             verdicts.appendText("$i ${if (accepted) "accept" else "reject"}\n")

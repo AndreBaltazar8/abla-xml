@@ -212,7 +212,23 @@ val generatedEncodings = ["UTF-8", "US-ASCII", "ISO-8859-1", "windows-1252"]
 fun generateDocument(seed: int): GeneratedDocument {
     val random = randomFrom(seed)
     val encoding = generatedEncodings[random.below(generatedEncodings.size)]
-    val writer = xmlWriter(XmlWriterOptions(encoding = encoding))
+    generateWith(xmlWriter(XmlWriterOptions(encoding = encoding)), random, encoding)
+}
+
+// The encoding generateDocument picks for a seed.
+fun generatedEncoding(seed: int): string {
+    val random = randomFrom(seed)
+    generatedEncodings[random.below(generatedEncodings.size)]
+}
+
+// The same document through a writer that was made elsewhere, such as a streaming one.
+fun generateThrough(var writer: XmlWriter, seed: int): GeneratedDocument {
+    val random = randomFrom(seed)
+    val encoding = generatedEncodings[random.below(generatedEncodings.size)]
+    generateWith(writer, random, encoding)
+}
+
+fun generateWith(var writer: XmlWriter, random: Random, encoding: string): GeneratedDocument {
     val generated = Generated(writer, random, encoding == "UTF-8", byteBuffer(), "", [], [], 40)
     writer.declaration()
     generated.element(0)

@@ -37,7 +37,14 @@ class XmlOptions(
     // Bytes of replacement text a document may expand, in total.
     val maxEntityBytes: int = 1048576,
     // How deep references inside replacement text may nest.
-    val maxEntityDepth: int = 16
+    val maxEntityDepth: int = 16,
+    // With a chunked source: the most of the document held at once, so also the
+    // largest single token (a tag, comment, instruction, reference or the whole
+    // DOCTYPE), the most kept for open elements and their namespaces. Text is the
+    // exception: it can be longer than this up to maxValueBytes.
+    val maxWindowBytes: int = 67108864,
+    // With a chunked source: how many bytes to ask it for at a time.
+    val chunkBytes: int = 65536
 )
 
 class XmlError(
@@ -121,7 +128,9 @@ class XmlReader(
     val options: XmlOptions,
     var src: string,
     var pos: int,
-    val bias: int,
+    // Bytes of the document before src[0]: a byte order mark, and with a chunked
+    // source what has already left the window.
+    var bias: int,
     val frameText: array<string>,
     val framePos: array<int>,
     val frameName: array<string>,
@@ -165,7 +174,16 @@ class XmlReader(
     var lastCr: bool = false,
     var pendingSkipped: string? = null,
     var lastPublicId: string = "",
-    var lastSystemId: string = ""
+    var lastSystemId: string = "",
+    // Where the text being gathered began.
+    var bufferLine: int = 0,
+    var bufferColumn: int = 0,
+    // A chunked source, while it may have more of the document.
+    val stream: XmlChunkDecoder = xmlNoDecoder(),
+    var streaming: bool = false,
+    var streamOpen: bool = false,
+    var sourceClosed: bool = false,
+    var scopeBytes: int = 0
 ) {
     // The next event. After the end of the document or an error, the same
     // event again.
@@ -175,6 +193,7 @@ class XmlReader(
         if (phase == PHASE_DONE) return XmlEvent(xmlEventEndOfDocument)
         val event = advance()
         val after = error
+        if (after != null || phase == PHASE_DONE) closeSource()
         if (after != null) return errorEvent(after)
         if (event == null) return errorEvent(XmlError("internal", "no event", 0, 1, 1))
         nodes = nodes + 1
@@ -183,6 +202,192 @@ class XmlReader(
             return next()
         }
         event
+    }
+
+    // Gives the source back. next() does this at the end of the document and on an
+    // error; a caller who stops reading before either calls it.
+    fun closeSource(): void {
+        if (!streaming || sourceClosed) return
+        sourceClosed = true
+        stream.source.close()
+        return
+    }
+
+    // Moves the window on: what is behind the cursor goes, and at least `wanted` more
+    // bytes come. False at the end of the document or on an error. Offsets into src
+    // don't survive this, but a distance from the cursor does. Replacement text never
+    // comes here, since the window stays still under an entity.
+    fun fill(wanted: int): bool {
+        if (!streamOpen || frameText.size > 0 || error != null) return false
+        val kept = src.size - pos
+        if (kept >= options.maxWindowBytes) {
+            fail("token_too_long", "a token is longer than the ${options.maxWindowBytes} bytes of the window")
+            streamOpen = false
+            return false
+        }
+        track(pos)
+        offsetTracked = offsetTracked - pos
+        bias = bias + pos
+        // Growing by what is held keeps a long token's copying linear.
+        var target = if (wanted > kept) wanted else kept
+        if (target < options.chunkBytes) target = options.chunkBytes
+        if (target > options.maxWindowBytes - kept) target = options.maxWindowBytes - kept
+        if (target < 1) target = 1
+        val pieces = byteBuffer()
+        pieces.appendText(src.slice(pos, src.size))
+        while (pieces.size() - kept < target) {
+            val piece = stream.next()
+            if (piece.size == 0) break
+            pieces.appendText(piece)
+        }
+        src = pieces.toText()
+        pos = 0
+        if (pieces.size() > kept) return true
+        streamOpen = false
+        if (stream.errorCode.size > 0) {
+            pos = kept
+            fail(stream.errorCode, stream.errorMessage)
+        }
+        false
+    }
+
+    // Has at least `count` bytes after the cursor unless the document is shorter.
+    // False only on an error.
+    fun ensureBytes(count: int): bool {
+        while (streamOpen && src.size - pos < count) {
+            if (!fill(count - (src.size - pos))) break
+        }
+        error == null
+    }
+
+    // Brings in the next `needle` at or after `from` bytes past the cursor, if there is
+    // one in the document, with `extra` bytes after it. A value can't go past
+    // `valueLimit`, so looking for its end stops there. False only on an error.
+    fun ensureFound(needle: string, from: int, extra: int, valueLimit: int): bool {
+        var distance = from
+        while (streamOpen) {
+            val at = src.indexOf(needle, pos + distance)
+            if (at >= 0 && at + needle.size + extra <= src.size) return true
+            if (at >= 0) {
+                if (!ensureBytes(at - pos + needle.size + extra)) return false
+                return true
+            }
+            distance = src.size - pos - needle.size + 1
+            if (distance < from) distance = from
+            if (valueLimit >= 0 && distance - from > valueLimit + 2) {
+                fail("value_too_long", "a value is longer than $valueLimit bytes")
+                return false
+            }
+            if (!fill(0)) break
+        }
+        error == null
+    }
+
+    // A reference: the document up to its ; or the first byte a name can't hold, when
+    // reading it fails anyway.
+    fun ensureReference(): bool {
+        var distance = 1
+        while (streamOpen) {
+            while (pos + distance < src.size) {
+                val b = src[pos + distance]
+                if (b == SEMI || b == LT || xmlIsSpace(b)) return true
+                distance = distance + 1
+            }
+            if (!fill(0)) break
+        }
+        error == null
+    }
+
+    // A start tag, up to its first > outside a quoted value, which is where reading it
+    // ends or has failed. The XML declaration's values are quoted the same way.
+    fun ensureStartTag(): bool = ensureUnquotedEnd(1)
+
+    fun ensureUnquotedEnd(start: int): bool {
+        var distance = start
+        var quote = 0
+        while (streamOpen) {
+            while (pos + distance < src.size) {
+                val b = src[pos + distance]
+                if (quote != 0) {
+                    if (b == quote) quote = 0
+                } else if (b == QUOTE || b == APOS) {
+                    quote = b
+                } else if (b == GT) {
+                    return true
+                }
+                distance = distance + 1
+            }
+            if (!fill(0)) break
+        }
+        error == null
+    }
+
+    // A DOCTYPE, whole: its declarations are read in one go and kept, and this bounds
+    // them. Follows what the parser skips, so it can't stop before the parser would.
+    fun ensureDoctype(): bool {
+        var distance = 9
+        var quote = 0
+        var inSubset = false
+        while (streamOpen) {
+            while (pos + distance < src.size) {
+                val b = src[pos + distance]
+                if (quote != 0) {
+                    if (b == quote) quote = 0
+                    distance = distance + 1
+                } else if (b == QUOTE || b == APOS) {
+                    quote = b
+                    distance = distance + 1
+                } else if (inSubset && b == LT) {
+                    if (!ensureBytes(distance + 4)) return false
+                    if (lookingAt(distance, "<!--")) {
+                        if (!ensureFound("-->", distance + 4, 0, -1)) return false
+                        val end = src.indexOf("-->", pos + distance + 4)
+                        distance = if (end < 0) src.size - pos else end - pos + 3
+                    } else if (lookingAt(distance, "<?")) {
+                        if (!ensureFound("?>", distance + 2, 0, -1)) return false
+                        val end = src.indexOf("?>", pos + distance + 2)
+                        distance = if (end < 0) src.size - pos else end - pos + 2
+                    } else {
+                        distance = distance + 1
+                    }
+                } else if (b == LBRACKET && !inSubset) {
+                    inSubset = true
+                    distance = distance + 1
+                } else if (b == RBRACKET && inSubset) {
+                    inSubset = false
+                    distance = distance + 1
+                } else if (b == GT && !inSubset) {
+                    return true
+                } else {
+                    distance = distance + 1
+                }
+            }
+            if (!fill(0)) break
+        }
+        error == null
+    }
+
+    // Everything the parser will look at for the markup at the cursor, so that only
+    // the document's real end looks like an end to it.
+    fun ensureMarkup(): bool {
+        if (!streamOpen || frameText.size > 0) return true
+        if (!ensureBytes(9)) return false
+        if (looking("<!--")) return ensureFound("--", 4, 1, options.maxValueBytes)
+        if (looking("<![CDATA[")) return ensureFound("]]>", 9, 0, options.maxValueBytes)
+        if (looking("<!DOCTYPE")) return ensureDoctype()
+        if (looking("<?")) return ensureFound("?>", 2, 0, options.maxValueBytes)
+        if (looking("</")) return ensureFound(">", 2, 0, -1)
+        ensureStartTag()
+    }
+
+    // Charges what an open element keeps until it closes. A chunked source's limit, as
+    // the size of a string is what bounds this otherwise.
+    fun chargeScope(bytes: int): bool {
+        scopeBytes = scopeBytes + bytes
+        if (streaming && scopeBytes > options.maxWindowBytes) {
+            return fail("state_too_large", "open elements and namespaces hold more than ${options.maxWindowBytes} bytes")
+        }
+        true
     }
 
     fun errorEvent(failure: XmlError): XmlEvent =
@@ -251,12 +456,15 @@ class XmlReader(
 
     fun atEnd(): bool = pos >= src.size
 
-    fun looking(text: string): bool {
+    fun looking(text: string): bool = lookingAt(0, text)
+
+    fun lookingAt(distance: int, text: string): bool {
         val n = text.size
-        if (pos + n > src.size) return false
+        val at = pos + distance
+        if (at + n > src.size) return false
         var i = 0
         while (i < n) {
-            if (src[pos + i] != text[i]) return false
+            if (src[at + i] != text[i]) return false
             i = i + 1
         }
         true
@@ -359,6 +567,8 @@ class XmlReader(
         }
         if (!started) {
             started = true
+            if (!ensureBytes(6)) return null
+            if (looking("<?xml") && src.size >= 6 && xmlIsSpace(src[5]) && !ensureUnquotedEnd(5)) return null
             if (!parseXmlDeclaration()) return null
         }
         if (phase == PHASE_CONTENT) return advanceContent()
@@ -368,6 +578,8 @@ class XmlReader(
     // The prolog and what follows the root element.
     fun advanceMisc(): XmlEvent? {
         skipSpace()
+        while (atEnd() && fill(0)) skipSpace()
+        if (error != null || !ensureMarkup()) return null
         val offset = pos
         if (atEnd()) {
             if (phase == PHASE_PROLOG) {
@@ -408,18 +620,33 @@ class XmlReader(
         val offset = bufferOffset
         buffer = byteBuffer()
         bufferOffset = -1
-        positioned(xmlEventText, offset, "", value)
+        XmlEvent(xmlEventText, value = value, byteOffset = offset, line = bufferLine, column = bufferColumn)
     }
 
+    // Text stays in the buffer once read, and the window can move on while it is
+    // gathered, so where it began is worked out now.
     fun noteText(): void {
-        if (bufferOffset < 0) bufferOffset = baseOffset()
+        if (bufferOffset < 0) {
+            val offset = baseOffset()
+            track(offset)
+            bufferOffset = offset + bias
+            bufferLine = lineTracked
+            bufferColumn = columnTracked
+        }
         return
     }
 
     fun advanceContent(): XmlEvent? {
+        val waiting = pendingSkipped
+        if (waiting != null) {
+            pendingSkipped = null
+            return skippedEvent(waiting)
+        }
         while (true) {
             if (pos >= src.size) {
                 if (frameText.size == 0) {
+                    if (fill(0)) continue
+                    if (error != null) return null
                     fail("unexpected_end", "element ${elementNames[elementNames.size - 1]} is not closed")
                     return null
                 }
@@ -432,9 +659,11 @@ class XmlReader(
                 val b = src[pos]
                 if (b == LT) {
                     if (buffer.size() > 0) return flushText()
+                    if (!ensureMarkup()) return null
                     return readMarkup()
                 }
                 if (b == AMP) {
+                    if (streamOpen && frameText.size == 0 && !ensureReference()) return null
                     val skipped = readContentReference()
                     if (error != null) return null
                     if (skipped != null) {
@@ -449,11 +678,6 @@ class XmlReader(
                     if (!readTextRun()) return null
                 }
             }
-            val waiting = pendingSkipped
-            if (waiting != null) {
-                pendingSkipped = null
-                return skippedEvent(waiting)
-            }
         }
         null
     }
@@ -464,11 +688,16 @@ class XmlReader(
     }
 
     fun readTextRun(): bool {
+        // A piece of the document may end inside "]]>" or between CR and LF, so
+        // what comes last in the window waits for what follows it.
+        val windowed = streamOpen && frameText.size == 0
+        if (windowed && !ensureBytes(3)) return false
         val begin = pos
         val size = src.size
         val text = src
+        val limit = if (streamOpen && frameText.size == 0) size - 2 else size
         var i = pos
-        while (i < size) {
+        while (i < limit) {
             val b = text[i]
             if (b == LT || b == AMP) break
             if (b == RBRACKET && i + 2 < size && text[i + 1] == RBRACKET && text[i + 2] == GT) {
@@ -477,6 +706,7 @@ class XmlReader(
             }
             i = i + 1
         }
+        if (i == limit && limit < size && i > begin && text[i - 1] == CR && text[i] == LF) i = i + 1
         noteText()
         buffer.appendText(sourceText(begin, i))
         pos = i
@@ -760,6 +990,12 @@ class XmlReader(
 
     fun popElementScope(): void {
         val top = elementNames.size - 1
+        scopeBytes = scopeBytes - elementNames[top].size
+        var ns = nsMarks[top]
+        while (ns < nsPrefixes.size) {
+            scopeBytes = scopeBytes - nsPrefixes[ns].size - nsUris[ns].size
+            ns = ns + 1
+        }
         elementNames.truncate(top)
         nsPrefixes.truncate(nsMarks[top])
         nsUris.truncate(nsMarks[top])
@@ -852,6 +1088,7 @@ class XmlReader(
         var namespaceUri = ""
         elementNames.append(name)
         nsMarks.append(nsPrefixes.size)
+        if (!chargeScope(name.size)) return null
         if (options.namespaces) {
             var i = 0
             while (i < names.size) {
@@ -873,6 +1110,7 @@ class XmlReader(
                     }
                     nsPrefixes.append(declared)
                     nsUris.append(values[i])
+                    if (!chargeScope(declared.size + values[i].size)) return null
                 }
                 i = i + 1
             }
@@ -1596,6 +1834,32 @@ fun xmlReader(source: string, options: XmlOptions = XmlOptions()): XmlReader {
     if (invalid >= 0) {
         reader.pos = invalid
         reader.fail("invalid_char", "invalid UTF-8 or a character XML forbids")
+    }
+    reader
+}
+
+// A reader that takes the document from `source` a piece at a time and holds a window
+// of it, at most options.maxWindowBytes, instead of the whole. It gives the same events
+// as xmlReader, with these differences, since a document can't be checked as a whole
+// before it is read: the events before a problem come first, and an invalid byte is
+// found when the reader reaches it, not before anything else; a token that doesn't fit
+// the window is the error token_too_long. The limits of `options` hold as they do for
+// xmlReader, so a big document needs a bigger maxBytes and maxNodes.
+fun xmlChunkedReader(source: XmlSource, options: XmlOptions = XmlOptions()): XmlReader {
+    val chunk = if (options.chunkBytes > 0) options.chunkBytes else 65536
+    val decoder = XmlChunkDecoder(source, options.maxBytes, options.maxWindowBytes, chunk)
+    val head = decoder.start()
+    val reader = XmlReader(
+        options, head, 0, decoder.bias,
+        [], [], [], [], [], [], [], [], [],
+        Map(), Map(), Map(),
+        byteBuffer(),
+        stream = decoder, streaming = true, streamOpen = true
+    )
+    if (head.size == 0 && decoder.errorCode.size > 0) {
+        reader.fail(decoder.errorCode, decoder.errorMessage)
+        reader.streamOpen = false
+        reader.closeSource()
     }
     reader
 }

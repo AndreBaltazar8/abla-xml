@@ -1,0 +1,76 @@
+// Compares the chunked reader with the reader over a whole string: the same document
+// must give the same events, split however it is.
+import "../../src/xml.ab"
+import "abla/bytes"
+
+fun describeEvent(event: XmlEvent): string {
+    val out = byteBuffer()
+    out.appendText("${event.kind} [${event.name}] [${event.prefix}] [${event.localName}] [${event.namespaceUri}] [${event.value}] @${event.byteOffset} ${event.line}:${event.column}")
+    for (a in event.attributes) out.appendText(" {${a.name}|${a.namespaceUri}|${a.value}|${a.specified}}")
+    out.toText()
+}
+
+private fun describeError(problem: XmlError?): string {
+    if (problem == null) return "none"
+    "${problem.code}@${problem.byteOffset} ${problem.line}:${problem.column} ${problem.entity}"
+}
+
+// A whole string is decoded and checked before its first event, which can't be done
+// to a document that hasn't arrived: these report whatever comes first in the document.
+private fun foundUpFront(code: string): bool =
+    code == "invalid_char" || code == "invalid_encoding" || code == "too_large"
+
+// A limit passed while text is gathered is noticed where it is passed.
+private fun reportedEarly(code: string): bool = code == "value_too_long"
+
+// "" when they agree, or what differs.
+fun compareReaders(source: string, options: XmlOptions, pieceBytes: int): string {
+    val whole = xmlReader(source, options)
+    val chunked = xmlChunkedReader(xmlStringSource(source, pieceBytes), options)
+    var count = 0
+    while (true) {
+        val a = whole.next()
+        val wholeCode = if (a.kind == xmlEventError) describeError(whole.error) else ""
+        if (a.kind == xmlEventError) {
+            val problem = whole.error
+            val code = if (problem != null) problem.code else ""
+            if (foundUpFront(code)) {
+                // The chunked reader must fail too, at or before the end of the document.
+                var guard = 0
+                while (guard < 100000000) {
+                    val b = chunked.next()
+                    if (b.kind == xmlEventError) return ""
+                    if (b.kind == xmlEventEndOfDocument) return "event $count: the whole reader says $wholeCode, the chunked one reaches the end"
+                    guard = guard + 1
+                }
+                return "no end"
+            }
+            val b = chunked.next()
+            if (b.kind != xmlEventError) return "event $count: the whole reader says $wholeCode, the chunked one ${describeEvent(b)}"
+            val other = chunked.error
+            if (reportedEarly(code) && other != null && other.code == code) return ""
+            val chunkedCode = describeError(other)
+            if (chunkedCode != wholeCode) {
+                // The encoding of a document reports at its start, with no line to count.
+                if (other != null && other.code == code && (code == "unsupported_encoding" || code == "encoding_mismatch")) return ""
+                return "event $count: $wholeCode against $chunkedCode"
+            }
+            return ""
+        }
+        val b = chunked.next()
+        if (b.kind == xmlEventError) {
+            val problem = chunked.error
+            return "event $count: ${describeEvent(a)} against ${describeError(problem)}"
+        }
+        val left = describeEvent(a)
+        val right = describeEvent(b)
+        if (left != right) return "event $count: $left against $right"
+        if (a.kind == xmlEventEndOfDocument) {
+            if (whole.skippedEntities != chunked.skippedEntities) return "skipped entities"
+            if (whole.version != chunked.version || whole.declaredEncoding != chunked.declaredEncoding || whole.standalone != chunked.standalone) return "declaration"
+            return ""
+        }
+        count = count + 1
+    }
+    ""
+}

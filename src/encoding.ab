@@ -211,3 +211,209 @@ fun xmlDecodeSource(source: string): XmlDecoded {
     if (encoding == xmlEncodingUtf8) return XmlDecoded(body, "", 0, bias)
     xmlDecodeSingleByte(body, encoding)
 }
+
+// Where a chunked reader gets a document's bytes from.
+interface XmlSource {
+    // Up to `maximum` bytes, in any encoding the document declares, split anywhere;
+    // "" at the end of the document or after a failure.
+    fun read(maximum: int): string
+    // Why reading stopped, when it wasn't the end of the document.
+    fun failure(): string = ""
+    // Called once the reader has finished with the source, even after an error.
+    fun close(): bool = true
+}
+
+// A string as a source, a piece at a time.
+class XmlStringSource(val text: string, var at: int = 0, val pieceBytes: int = 65536) : XmlSource {
+    fun read(maximum: int): string {
+        val wanted = if (maximum < pieceBytes) maximum else pieceBytes
+        val end = if (at + wanted > text.size) text.size else at + wanted
+        val piece = text.slice(at, end)
+        at = end
+        piece
+    }
+}
+
+fun xmlStringSource(text: string, pieceBytes: int = 65536): XmlStringSource =
+    XmlStringSource(text, 0, pieceBytes)
+
+private val MODE_UTF8 = 0
+private val MODE_SINGLE = 1
+private val MODE_UTF16 = 2
+
+// The start of a document decides how much more is needed to sniff its declaration.
+private fun xmlDeclarationIncomplete(text: string, limit: int): bool {
+    if (text.size < 6) return "<?xml".startsWith(text) || text.startsWith("<?xml")
+    text.startsWith("<?xml") && xmlIsSpace(text[5]) && text.indexOf("?>") < 0 && text.size < limit
+}
+
+// xmlDecodeSource for a document arriving in pieces: UTF-8 text that is valid so far,
+// however the bytes were split. It stops at the first problem, after giving what came
+// before it, and holds at most one piece plus the bytes of one split character.
+class XmlChunkDecoder(
+    val source: XmlSource,
+    val maxBytes: int,
+    val maxHead: int,
+    val pieceBytes: int,
+    var mode: int = 0,
+    var encoding: int = 0,
+    var bigEndian: bool = false,
+    var bias: int = 0,
+    var carry: string = "",
+    var rawBytes: int = 0,
+    var ended: bool = false,
+    var done: bool = false,
+    var errorCode: string = "",
+    var errorMessage: string = ""
+) {
+    fun stop(code: string, message: string): void {
+        if (errorCode.size == 0) {
+            errorCode = code
+            errorMessage = message
+        }
+        done = true
+        return
+    }
+
+    fun pull(): string {
+        if (ended || done) return ""
+        val piece = source.read(pieceBytes)
+        if (piece.size == 0) {
+            val why = source.failure()
+            if (why.size > 0) stop("source_failed", why) else ended = true
+            return ""
+        }
+        rawBytes = rawBytes + piece.size
+        if (rawBytes > maxBytes) {
+            stop("too_large", "the document is larger than $maxBytes bytes")
+            return ""
+        }
+        piece
+    }
+
+    fun gather(first: string): string {
+        val text = byteBuffer()
+        text.appendText(first)
+        var joined = first
+        while (!ended && !done && xmlDeclarationIncomplete(joined, maxHead)) {
+            text.appendText(pull())
+            joined = text.toText()
+        }
+        joined
+    }
+
+    // Everything that arrives before the first next(): what the byte order mark and
+    // the declaration say, as xmlDecodeSource decides it, and the text so far.
+    fun start(): string {
+        val mark = byteBuffer()
+        while (!ended && !done && mark.size() < 3) mark.appendText(pull())
+        val head = mark.toText()
+        if (done) return ""
+        if (head.size >= 2 && ((head[0] == 0xFF && head[1] == 0xFE) || (head[0] == 0xFE && head[1] == 0xFF))) {
+            mode = MODE_UTF16
+            bigEndian = head[0] == 0xFE
+            var text = convert(head.slice(2, head.size))
+            while (!ended && !done && xmlDeclarationIncomplete(text, maxHead)) {
+                text = text + convert(pull())
+            }
+            if (ended && !done) text = text + convert("")
+            if (done && errorCode.size > 0) return ""
+            val declared = xmlSniffDeclaredEncoding(text)
+            if (declared.size > 0 && xmlEncodingFromName(declared) != xmlEncodingUtf16) {
+                stop("encoding_mismatch", "the byte order mark and the declared encoding disagree")
+                return ""
+            }
+            return checked(text)
+        }
+        var body = head
+        if (head.size >= 3 && head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF) {
+            bias = 3
+            body = head.slice(3, head.size)
+        }
+        body = gather(body)
+        if (done) return ""
+        val declared = xmlSniffDeclaredEncoding(body)
+        if (declared.size > 0 && xmlEncodingNameValid(declared)) {
+            encoding = xmlEncodingFromName(declared)
+            if (encoding == xmlEncodingUnknown) {
+                stop("unsupported_encoding", "this parser can't read the declared encoding")
+                return ""
+            }
+            if (encoding == xmlEncodingUtf16 || (bias > 0 && encoding != xmlEncodingUtf8)) {
+                stop("encoding_mismatch", "the byte order mark and the declared encoding disagree")
+                return ""
+            }
+            if (encoding != xmlEncodingUtf8) mode = MODE_SINGLE
+        }
+        checked(convert(body))
+    }
+
+    // The next piece of text, "" at the end of what can be given.
+    fun next(): string {
+        while (!done) {
+            val piece = pull()
+            if (done) return ""
+            val text = checked(convert(piece))
+            if (ended) done = true
+            if (text.size > 0) return text
+        }
+        ""
+    }
+
+    // Stops at a character XML forbids, keeping the text before it.
+    fun checked(text: string): string {
+        val invalid = xmlFirstInvalidChar(text)
+        if (invalid < 0) return text
+        stop("invalid_char", "invalid UTF-8 or a character XML forbids")
+        text.slice(0, invalid)
+    }
+
+    // Whole characters out of the bytes so far; the rest waits for the next piece.
+    fun convert(raw: string): string {
+        if (mode == MODE_SINGLE) {
+            val decoded = xmlDecodeSingleByte(raw, encoding)
+            if (decoded.errorCode.size == 0) return decoded.text
+            stop(decoded.errorCode, "the bytes aren't valid in the declared encoding")
+            return xmlDecodeSingleByte(raw.slice(0, decoded.errorOffset), encoding).text
+        }
+        val joined = if (carry.size > 0) carry + raw else raw
+        carry = ""
+        if (mode == MODE_UTF8) {
+            if (ended) return joined
+            var keep = joined.size
+            var back = 1
+            while (back <= 3 && back <= joined.size) {
+                val b = joined[joined.size - back]
+                if (b >= 0xC0) {
+                    if (xmlUtf8Size(b) > back) keep = joined.size - back
+                    break
+                }
+                if (b < 0x80) break
+                back = back + 1
+            }
+            if (keep == joined.size) return joined
+            carry = joined.slice(keep, joined.size)
+            return joined.slice(0, keep)
+        }
+        var usable = joined.size - joined.size % 2
+        if (ended && usable != joined.size) {
+            stop("invalid_encoding", "the bytes aren't valid in the declared encoding")
+            return ""
+        }
+        if (!ended && usable >= 2) {
+            val top = if (bigEndian) joined[usable - 2] else joined[usable - 1]
+            if (top >= 0xD8 && top <= 0xDB) usable = usable - 2
+        }
+        carry = joined.slice(usable, joined.size)
+        if (usable == 0) return ""
+        val decoded = xmlDecodeUtf16("\x00\x00" + joined.slice(0, usable), bigEndian)
+        if (decoded.errorCode.size > 0) {
+            stop(decoded.errorCode, "the bytes aren't valid in the declared encoding")
+            return ""
+        }
+        decoded.text
+    }
+}
+
+// The decoder of a reader over a whole string, which never asks it for anything.
+fun xmlNoDecoder(): XmlChunkDecoder = XmlChunkDecoder(xmlStringSource(""), 0, 0, 0)

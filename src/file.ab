@@ -1,0 +1,58 @@
+// Files as a source and a sink, so a document needn't fit in memory. The parser and
+// the writer do no I/O themselves: only a program that makes one of these reads or
+// writes anything.
+import "abla/fs"
+import "abla/sys/linux"
+import "encoding.ab"
+import "writer.ab"
+
+class XmlFileSource(val filePath: Path, val descriptor: int, val expected: int, var seen: int = 0, var problem: string = "", var open: bool = true) : XmlSource {
+    // The system's read gives "" for an end and for a failure alike, so an end
+    // before the file's size counts as the failure.
+    fun read(maximum: int): string {
+        if (!open) return ""
+        val piece = LinuxFileDescriptor(descriptor).read(maximum)
+        seen = seen + piece.size
+        if (piece.size == 0 && seen < expected) problem = "reading ${filePath.text} failed after $seen of $expected bytes"
+        piece
+    }
+
+    fun failure(): string = problem
+
+    fun close(): bool {
+        if (!open) return true
+        open = false
+        LinuxFileDescriptor(descriptor).close() == 0
+    }
+}
+
+// The file's bytes for xmlChunkedReader. A file that can't be opened comes as the
+// reader's error source_failed.
+fun xmlFileSource(filePath: Path): XmlFileSource {
+    val info = filePath.info()
+    if (info.isDirectory()) return XmlFileSource(filePath, -1, 0, 0, "${filePath.text} is a directory", false)
+    val file = linuxOpen(filePath.text)
+    if (file.descriptor < 0) return XmlFileSource(filePath, -1, 0, 0, "can't open ${filePath.text}: error ${-file.descriptor}", false)
+    XmlFileSource(filePath, file.descriptor, info.size)
+}
+
+// Keeps the file open between writes, and replaces what was there. Written bytes
+// aren't removed on failure: the caller decides what a partial file means.
+class XmlFileSink(val descriptor: int, var open: bool = true) : XmlSink {
+    fun write(bytes: string): bool = open && linuxWriteAll(descriptor, bytes)
+
+    fun close(): bool {
+        if (!open) return descriptor >= 0
+        open = false
+        LinuxFileDescriptor(descriptor).close() == 0
+    }
+}
+
+// A sink writing `filePath`, created or truncated now. One that can't be opened fails
+// its first write, which is the writer's error sink_failed.
+fun xmlFileSink(filePath: Path): XmlFileSink {
+    filePath.createParentDirectories()
+    // O_WRONLY | O_CREAT | O_TRUNC.
+    val file = linuxOpen(filePath.text, 577, 438)
+    XmlFileSink(file.descriptor, file.descriptor >= 0)
+}

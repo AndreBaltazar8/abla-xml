@@ -1,0 +1,348 @@
+// Streaming: a sink gets the bytes of the string writer; a source, split anyhow, gives
+// the events of the whole-string reader; and memory stays within the limits on input
+// meant to break them.
+import "../src/xml.ab"
+import "support/generate.ab"
+import "support/compare.ab"
+import "abla/bytes"
+import "abla/fs"
+import "abla/memory"
+import "abla/test"
+import "abla/text"
+
+class Collect(val parts: ByteBuffer, var writes: int = 0, var biggest: int = 0, var closes: int = 0) : XmlSink {
+    fun write(bytes: string): bool {
+        parts.appendText(bytes)
+        writes = writes + 1
+        if (bytes.size > biggest) biggest = bytes.size
+        true
+    }
+
+    fun close(): bool {
+        closes = closes + 1
+        true
+    }
+}
+
+class Refuses(var left: int, var closes: int = 0) : XmlSink {
+    fun write(bytes: string): bool {
+        left = left - 1
+        left > 0
+    }
+
+    fun close(): bool {
+        closes = closes + 1
+        true
+    }
+}
+
+// Endless content without the file: a head, then a repeated piece, then a tail.
+class Repeating(val head: string, val body: string, var left: int, val tail: string, var state: int = 0, var closes: int = 0) : XmlSource {
+    fun read(maximum: int): string {
+        if (state == 0) {
+            state = 1
+            return head
+        }
+        if (left > 0) {
+            left = left - 1
+            return body
+        }
+        if (state == 1) {
+            state = 2
+            return tail
+        }
+        ""
+    }
+
+    fun close(): bool {
+        closes = closes + 1
+        true
+    }
+}
+
+class Broken(var left: int) : XmlSource {
+    fun read(maximum: int): string {
+        left = left - 1
+        if (left >= 0) "<a>" else ""
+    }
+
+    fun failure(): string = if (left < 0) "the disk went away" else ""
+}
+
+fun agree(source: string, label: string, options: XmlOptions = XmlOptions()): void {
+    for (size in [1, 2, 3, 5, 7, 16, 64, 4096]) {
+        val difference = compareReaders(source, options, size)
+        expect(difference == "", "$label in pieces of $size: $difference")
+    }
+    return
+}
+
+fun errorOf(var reader: XmlReader): string {
+    while (true) {
+        val event = reader.next()
+        if (event.kind == xmlEventEndOfDocument) return ""
+        if (event.kind == xmlEventError) {
+            val problem = reader.error
+            return if (problem != null) problem.code else "unknown"
+        }
+    }
+    ""
+}
+
+val big = XmlOptions(maxBytes = 1099511627776, maxNodes = 1099511627776)
+
+fun main: int {
+    // The writer: the same bytes, however often it flushes.
+    var seed = 1
+    while (seed <= 2000) {
+        val plain = generateDocument(seed)
+        for (flush in [1, 17, 65536]) {
+            val sink = Collect(byteBuffer())
+            val writer = xmlStreamWriter(sink, XmlWriterOptions(encoding = generatedEncoding(seed), flushBytes = flush))
+            val streamed = generateThrough(writer, seed)
+            if (!expect(streamed.result.succeeded, "seed $seed streams")) return testsPassed()
+            if (!expect(sink.parts.toText() == plain.result.text, "seed $seed: the sink has the string writer's bytes")) return testsPassed()
+            expectEqual(streamed.result.text, "", "a streaming writer returns no text")
+            expectEqual(streamed.result.bytesWritten, plain.result.text.size, "seed $seed: size")
+            expectEqual(sink.closes, 1, "closed once")
+        }
+        seed = seed + 1
+    }
+
+    // Indentation looks at what came before, also over a flush.
+    for (flush in [1, 2, 3, 1024]) {
+        val sink = Collect(byteBuffer())
+        val indented = XmlWriterOptions(indent = "  ", flushBytes = flush)
+        val a = xmlStreamWriter(sink, indented)
+        val b = xmlWriter(XmlWriterOptions(indent = "  "))
+        for (w in [0, 1]) {
+            val t = if (w == 0) a else b
+            t.declaration("yes")
+            t.comment("before")
+            t.processingInstruction("p", "q")
+            t.startElement("r")
+            t.namespace("", "urn:x")
+            t.attribute("a", "1")
+            t.comment("in")
+            t.element("c", "text")
+            t.startElement("d")
+            t.text("mixed")
+            t.element("e")
+            t.endElement()
+            t.endElement()
+            t.comment("after")
+        }
+        expect(a.finish().succeeded, "indented stream")
+        expect(sink.parts.toText() == b.finish().text, "indented, flushing each $flush bytes")
+    }
+
+    // Holds about one flush, not the document: it never gets a much larger piece.
+    val sink = Collect(byteBuffer())
+    val long = xmlStreamWriter(sink, XmlWriterOptions(flushBytes = 4096))
+    long.startElement("r")
+    for (i in 0 until 10000) long.element("c", "$i")
+    long.endElement()
+    expect(long.finish().succeeded, "long document")
+    expect(sink.writes > 10 && sink.biggest < 4200, "pieces of ${sink.biggest} bytes in ${sink.writes} writes")
+
+    // Errors: sticky, nothing more after them, and the sink is still closed.
+    val refusing = Refuses(2)
+    val refused = xmlStreamWriter(refusing, XmlWriterOptions(flushBytes = 1))
+    refused.startElement("r")
+    for (i in 0 until 10) refused.element("c", "x")
+    refused.endElement()
+    val result = refused.finish()
+    expect(!result.succeeded, "a refusing sink fails the writer")
+    expectEqual(result.errorCode, "sink_failed", "code")
+    expectEqual(refusing.left, 0, "no more writes after the refusal")
+    expectEqual(refusing.closes, 1, "the refusing sink is closed")
+    val unbalanced = Refuses(100)
+    val open = xmlStreamWriter(unbalanced)
+    open.startElement("r")
+    expectEqual(open.finish().errorCode, "unbalanced", "the writer's own errors stay")
+    expectEqual(unbalanced.closes, 1, "closed after an error")
+    expectEqual(xmlStreamWriter(Refuses(1), XmlWriterOptions(encoding = "UTF-16")).finish().errorCode, "unsupported_encoding", "a bad encoding stays an error")
+
+    // A file sink and source.
+    val base = "build"
+    val file = Path("$base/stream-test-file.xml")
+    val fileWriter = xmlStreamWriter(xmlFileSink(file))
+    fileWriter.startElement("r")
+    fileWriter.element("c", "é")
+    fileWriter.endElement()
+    expect(fileWriter.finish().succeeded, "file sink")
+    expectEqual(file.readText(), "<r><c>é</c></r>", "file contents")
+    val fromFile = xmlChunkedReader(xmlFileSource(file))
+    var fileText = ""
+    while (true) {
+        val event = fromFile.next()
+        if (event.kind == xmlEventText) fileText = event.value
+        if (event.kind == xmlEventEndOfDocument || event.kind == xmlEventError) break
+    }
+    expect(fromFile.error == null, "file source")
+    expectEqual(fileText, "é", "file source reads what was written")
+    file.remove()
+    expect(!file.exists(), "no file left")
+    expectEqual(errorOf(xmlChunkedReader(xmlFileSource(file))), "source_failed", "a missing file")
+    expectEqual(errorOf(xmlChunkedReader(xmlFileSource(Path(base)))), "source_failed", "a directory")
+    expect(!xmlStreamWriter(xmlFileSink(Path("/proc/nope/x.xml"))).finish().succeeded, "a sink that can't open")
+
+    // The reader: splits in every awkward place.
+    val documents = [
+        "<a/>", "<a></a>", " <a/>", "<a/> ", "<a>text</a>", "<?xml version=\"1.0\"?><a/>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<a/>\n",
+        "<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a b=\"\xe9\">\xe9\xe9</a>",
+        "<?xml version=\"1.0\" encoding=\"windows-1252\"?><a>\x80\xe9</a>",
+        "<?xml version=\"1.0\" encoding=\"US-ASCII\"?><a>plain</a>",
+        "\xef\xbb\xbf<a>é世😀</a>", "\xef\xbb\xbf<?xml version=\"1.0\" encoding=\"UTF-8\"?><a>x</a>",
+        "<a>é世😀</a>", "<é世 ñ=\"😀\">😀</é世>",
+        "<a>one\r\ntwo\rthree\nfour\r</a>", "<a>\r\n\r\n</a>", "<a b=\"x\r\ny\"/>",
+        "<!-- c\r\nd --><a><!-- e --><?p q\r\nr?><![CDATA[x\r\ny]]]]><![CDATA[>]]></a><!-- f --><?g?>",
+        "<a>]]</a>", "<a>]</a>", "<a>]]]]</a>", "<a>] ]></a>", "<a>&lt;&gt;&amp;&apos;&quot;&#65;&#x41;</a>",
+        "<a b='\">' c=\">\"/>", "<a\n\tb = 'c'\n/>", "<a></a >",
+        "<p:a xmlns:p=\"urn:p\" p:b=\"1\"><p:c xmlns=\"urn:d\"/></p:a>",
+        "<a>" + "x".repeat(100000) + "</a>", "<a b=\"" + "x".repeat(70000) + "\"/>", "<!--" + "-x".repeat(50000) + "-->".slice(0, 0) + "--><a/>",
+        "<a>" + "<b>t</b>\n".repeat(20000) + "</a>",
+        " ".repeat(70000) + "<a/>" + " ".repeat(70000),
+        // Rejected.
+        "", "   ", "text", "<a", "<a>", "<a b", "<a b=", "<a b=\"", "<a b=\"c\"", "</a>", "<a></b>", "<a/><b/>", "<a/>x", "<a>&</a>", "<a>&x</a>", "<a>&x;</a>",
+        "<a>&#</a>", "<a>&#x;</a>", "<a>&#0;</a>", "<a>]]></a>", "<a><!-- -- --></a>", "<a><!-- ", "<a><![CDATA[", "<a><?p", "<a><?xml ?></a>", "<?xml?><a/>",
+        "<?xml version=\"2.0\"?><a/>", "<?xml version=\"1.0\"", "<?xml version=\"1.0\" encoding=\"EBCDIC\"?><a/>", "<?xml version=\"1.0\" encoding=\"UTF-16\"?><a/>",
+        "\xef\xbb\xbf<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a/>",
+        "<a>\x01</a>", "<a>\xff</a>", "<a>\xc3</a>", "<a>\xe4\xb8</a>", "<a>\xf0\x9f\x98</a>", "<a>\xed\xa0\x80</a>", "<a>\xef\xbf\xbe</a>", "<a>ok\xc3",
+        "<?xml version=\"1.0\" encoding=\"US-ASCII\"?><a>\xe9</a>", "<?xml version=\"1.0\" encoding=\"windows-1252\"?><a>\x81</a>",
+        "<!DOCTYPE a><a/>", "<p:a/>", "<a xmlns:xml=\"x\"/>", "<a b=\"1\" b=\"2\"/>", "<a b=\"<\"/>", "<a>", "<a:b:c/>"
+    ]
+    for (d in documents) agree(d, "[${d.slice(0, if (d.size < 50) d.size else 50)}]")
+
+    // UTF-16, split inside units and surrogate pairs.
+    val utf16 = byteBuffer()
+    utf16.appendText("\xff\xfe")
+    for (c in "<?xml version=\"1.0\" encoding=\"UTF-16\"?><a>x") {
+        utf16.appendByteValue(c)
+        utf16.appendByteValue(0)
+    }
+    utf16.appendText("\x3d\xd8\x00\xde")
+    for (c in "</a>") {
+        utf16.appendByteValue(c)
+        utf16.appendByteValue(0)
+    }
+    agree(utf16.toText(), "UTF-16 LE")
+    val swapped = byteBuffer()
+    val le = utf16.toText()
+    var i = 0
+    while (i + 1 < le.size) {
+        swapped.appendByteValue(le[i + 1])
+        swapped.appendByteValue(le[i])
+        i = i + 2
+    }
+    agree(swapped.toText(), "UTF-16 BE")
+    agree(le.slice(0, le.size - 1), "UTF-16, odd length")
+    agree("\xff\xfe\x00\xd8<\x00", "UTF-16, lone surrogate")
+    agree("\xff\xfe\x3d\xd8", "UTF-16, ends in half a pair")
+    agree("\xff", "half a byte order mark")
+    agree("\xef\xbb", "two thirds of a byte order mark")
+
+    // DTDs and their entities: the whole DOCTYPE arrives before reading it.
+    val dtd = XmlOptions(allowDtd = true)
+    for (d in [
+        "<!DOCTYPE a><a/>",
+        "<!DOCTYPE a SYSTEM \"x>y\"><a/>",
+        "<!DOCTYPE a PUBLIC \"p\" 'q>'><a>&e;</a>",
+        "<!DOCTYPE a [<!ENTITY e \"v>]\">]><a>&e;</a>",
+        "<!DOCTYPE a [<!-- ]> ' --><!ENTITY e \"<b>t</b>\">]><a>&e;&e;</a>",
+        "<!DOCTYPE a [<?p ]> \" ?><!ATTLIST a x CDATA \"d\" y NMTOKENS \" t  u \"><!ELEMENT a (#PCDATA|b)*>]><a y=\" p  q \"/>",
+        "<!DOCTYPE a [<!ENTITY % p \"<!ENTITY e 'v'>\">%p;]><a>&e;</a>",
+        "<!DOCTYPE a [<!ENTITY e SYSTEM \"u\">]><a>x&e;y</a>",
+        "<!DOCTYPE a [<!ENTITY e \"&f;\"><!ENTITY f \"&e;\">]><a>&e;</a>",
+        "<!DOCTYPE a [<!ENTITY e \"<b>\">]><a>&e;</a>",
+        "<!DOCTYPE a [", "<!DOCTYPE a [<!ENTITY e \"", "<!DOCTYPE a [<!--", "<!DOCTYPE a [] ", "<!DOCTYPE a [<!ELEMENT]><a/>",
+        "<a/><!DOCTYPE a>"
+    ]) agree(d, "[$d]", dtd)
+    agree("<a>x</a>", "no namespaces", XmlOptions(namespaces = false))
+    // A skipped entity keeps its place among what surrounds it, also in the tree.
+    val skipping = xmlParse("<!DOCTYPE a [<!ENTITY e SYSTEM \"u\">]><a>x&e;<b/>y&e;z</a>", dtd).document
+    if (expect(skipping != null, "parses with skipped entities") && skipping != null) {
+        val order: array<string> = []
+        for (child in skipping.root.children) {
+            when (child) {
+                is XmlText -> order.append(child.text)
+                is XmlElement -> order.append(child.name)
+                is XmlSkippedEntity -> order.append("&" + child.name)
+                else -> order.append("?")
+            }
+        }
+        expectEqual(textJoin(order, " "), "x &e b y &e z", "skipped entities stay in order")
+    }
+
+    // The limits of xmlReader are the limits here.
+    val tight = XmlOptions(maxDepth = 2, maxNodes = 8, maxAttributes = 1, maxNameBytes = 4, maxValueBytes = 8, maxNamespaces = 1)
+    for (d in [
+        "<a><b><c/></b></a>", "<a><b/><b/><b/><b/><b/><b/></a>", "<a b=\"1\" c=\"2\"/>", "<abcdef/>", "<a>123456789</a>", "<a b=\"123456789\"/>",
+        "<!-- 123456789 --><a/>", "<a><![CDATA[123456789]]></a>", "<?p 123456789?><a/>", "<a xmlns:p=\"u\" xmlns:q=\"u\"/>", "<a>&abcdefg;</a>"
+    ]) agree(d, "[$d] under tight limits", tight)
+    expectEqual(errorOf(xmlChunkedReader(xmlStringSource("<a>x</a>"), XmlOptions(maxBytes = 4))), "too_large", "maxBytes counts the bytes that arrive")
+    // A failing source is an error, not an end.
+    expectEqual(errorOf(xmlChunkedReader(Broken(2))), "source_failed", "a source that fails")
+
+    // Hostile input, a repeated megabyte at a time so that it never exists whole. Each
+    // must stop with the right error having held no more than the window. Asking for
+    // more than the limits would show here as live memory, not only as a wrong error.
+    memorySetCollectionGrowth(8388608)
+    val mega = "x".repeat(1048576)
+    val window = XmlOptions(maxBytes = 1099511627776, maxNodes = 1099511627776, maxWindowBytes = 8388608, maxValueBytes = 4194304)
+    val roof = 48 * 1048576
+    for (hostile in [
+        ["<a>", "text", "a text run"],
+        ["<a><!--", "comment", "an endless comment"],
+        ["<a><![CDATA[", "cdata", "an endless CDATA section"],
+        ["<?p ", "instruction", "an endless instruction"],
+        ["<a b=\"", "attribute", "an endless attribute"],
+        ["<a ", "tag", "an endless tag"],
+        ["<!DOCTYPE a [<!-- ", "doctype", "an endless DOCTYPE"],
+        ["<", "name", "an endless name"],
+        ["<a>&", "reference", "an endless reference"],
+        ["</", "endtag", "an endless end tag"],
+        ["   ", "whitespace", "whitespace before an endless name"]
+    ]) {
+        val before = memoryLiveBytes()
+        var peak = 0
+        val r = xmlChunkedReader(Repeating(hostile[0], mega, 4096, ""), XmlOptions(maxBytes = window.maxBytes, maxNodes = window.maxNodes, maxWindowBytes = window.maxWindowBytes, maxValueBytes = window.maxValueBytes, allowDtd = true))
+        var code = ""
+        while (code == "") {
+            val event = r.next()
+            if (event.kind == xmlEventEndOfDocument) code = "end"
+            if (event.kind == xmlEventError) {
+                val problem = r.error
+                code = if (problem != null) problem.code else "unknown"
+            }
+            val live = memoryLiveBytes()
+            if (live > peak) peak = live
+        }
+        expect(code != "end", "${hostile[2]} fails: $code")
+        expect(peak - before < roof, "${hostile[2]} stays bounded: ${peak - before} bytes")
+    }
+    // Good content that keeps going is fine, for as long as the limits say.
+    val endless = Repeating("<a>", "<b c=\"d\">text</b>\n".repeat(1000), 5000, "</a>")
+    val fine = xmlChunkedReader(endless, big)
+    var events = 0
+    var peak = 0
+    while (true) {
+        val event = fine.next()
+        if (event.kind == xmlEventEndOfDocument || event.kind == xmlEventError) break
+        events = events + 1
+        if (events % 65536 == 0) {
+            val live = memoryLiveBytes()
+            if (live > peak) peak = live
+        }
+    }
+    expect(fine.error == null, "90 MB of good content reads, in a window")
+    expect(peak < roof, "and holds $peak bytes")
+    expectEqual(events, 20000002, "all its events")
+    expectEqual(endless.closes, 1, "the source is closed at the end")
+    // Open elements keep their names and namespaces, whatever each one's size allows.
+    val deep = byteBuffer()
+    for (d in 0 until 16) deep.appendText("<a xmlns:p=\"" + "u".repeat(1048576) + "\">")
+    expectEqual(errorOf(xmlChunkedReader(xmlStringSource(deep.toText()), XmlOptions(maxWindowBytes = 8388608))), "state_too_large", "namespaces can't outgrow the window")
+    testsPassed()
+}

@@ -8,6 +8,25 @@ import "abla/text"
 import "chars.ab"
 import "encoding.ab"
 
+// Where a streaming writer's bytes go, as they are encoded.
+interface XmlSink {
+    // False stops the writer with the error sink_failed.
+    fun write(bytes: string): bool
+    // Called by finish(), even after an error; false is also sink_failed.
+    fun close(): bool = true
+}
+
+// A sink from a plain function. A sink that has to change state of its own is a class
+// implementing XmlSink: a closure that changes a capture can't be stored.
+class XmlCallbackSink(val callback: (string) -> bool) : XmlSink {
+    fun write(bytes: string): bool {
+        val call = callback
+        call(bytes)
+    }
+}
+
+fun xmlCallbackSink(callback: (string) -> bool): XmlCallbackSink = XmlCallbackSink(callback)
+
 class XmlWriterOptions(
     // UTF-8, US-ASCII, ISO-8859-1 or windows-1252; the XML declaration spells
     // it as given here. Characters the encoding lacks become character
@@ -16,21 +35,25 @@ class XmlWriterOptions(
     // One level of indentation; "" writes no whitespace at all. An element
     // holding text keeps its content on one line, so indenting never changes
     // what a text node contains.
-    val indent: string = ""
+    val indent: string = "",
+    // How many encoded bytes a streaming writer holds before giving them to its sink.
+    val flushBytes: int = 65536
 )
 
 class XmlWriteResult(
     val succeeded: bool,
     val text: string,
     val errorCode: string,
-    val errorMessage: string
+    val errorMessage: string,
+    // The document's size. A streaming writer's `text` is empty: its sink has the bytes.
+    val bytesWritten: int = 0
 )
 
 class XmlWriter(
     val encodingName: string,
     val encoding: int,
     val indent: string,
-    val out: ByteBuffer,
+    var out: ByteBuffer,
     val names: array<string>,
     val hasText: array<bool>,
     val hasChild: array<bool>,
@@ -44,7 +67,12 @@ class XmlWriter(
     var written: bool = false,
     var finished: bool = false,
     var errorCode: string = "",
-    var errorMessage: string = ""
+    var errorMessage: string = "",
+    val sink: XmlSink? = null,
+    val flushBytes: int = 65536,
+    var flushed: int = 0,
+    var lastFlushedByte: int = -1,
+    var sinkClosed: bool = false
 ) {
     fun failed(): bool = errorCode.size > 0
 
@@ -151,6 +179,7 @@ class XmlWriter(
         if (!checkText(value)) return
         hasText[hasText.size - 1] = true
         escape(value, false)
+        flushWhenFull()
         return
     }
 
@@ -167,6 +196,7 @@ class XmlWriter(
         hasText[hasText.size - 1] = true
         val body = value.replace("]]>", "]]]]><![CDATA[>").replace("\r", "]]>&#xD;<![CDATA[")
         if (!raw("<![CDATA[$body]]>")) return
+        flushWhenFull()
         return
     }
 
@@ -181,6 +211,7 @@ class XmlWriter(
         beforeMarkup()
         if (!raw("<!--$value-->")) return
         written = true
+        flushWhenFull()
         return
     }
 
@@ -198,6 +229,7 @@ class XmlWriter(
         beforeMarkup()
         if (!raw(if (data.size > 0) "<?$target $data?>" else "<?$target?>")) return
         written = true
+        flushWhenFull()
         return
     }
 
@@ -226,6 +258,7 @@ class XmlWriter(
         nsPrefixes.truncate(nsMarks[top])
         nsUris.truncate(nsMarks[top])
         nsMarks.truncate(top)
+        flushWhenFull()
         return
     }
 
@@ -238,14 +271,48 @@ class XmlWriter(
     }
 
     // Ends the document and gives its bytes, or the first error. Nothing is
-    // written after an error, and the text is then empty.
+    // written after an error, and the text is then empty. A streaming writer
+    // gives its sink the last bytes and closes it; after an error, the sink may
+    // already have a part of the document, which the caller has to discard.
     fun finish(): XmlWriteResult {
         if (!failed() && names.size > 0) fail("unbalanced", "element ${names[names.size - 1]} is still open")
         if (!failed() && !rootSeen) fail("no_root", "a document needs a root element")
-        if (failed()) return XmlWriteResult(false, "", errorCode, errorMessage)
+        if (failed()) {
+            closeSink()
+            return XmlWriteResult(false, "", errorCode, errorMessage)
+        }
         if (indent.size > 0 && !finished) out.appendText("\n")
         finished = true
-        XmlWriteResult(true, out.toText(), "", "")
+        if (sink == null) return XmlWriteResult(true, out.toText(), "", "", out.size())
+        flush()
+        closeSink()
+        if (failed()) return XmlWriteResult(false, "", errorCode, errorMessage)
+        XmlWriteResult(true, "", "", "", flushed)
+    }
+
+    fun flushWhenFull(): void {
+        if (sink != null && out.size() >= flushBytes) flush()
+        return
+    }
+
+    // Gives the sink what is held, and nothing after an error.
+    fun flush(): void {
+        val target = sink
+        if (target == null || failed() || out.size() == 0) return
+        lastFlushedByte = out.byteAt(out.size() - 1)
+        flushed = flushed + out.size()
+        val ok = target.write(out.toText())
+        out = byteBuffer()
+        if (!ok) fail("sink_failed", "the sink refused the bytes")
+        return
+    }
+
+    fun closeSink(): void {
+        val target = sink
+        if (target == null || sinkClosed) return
+        sinkClosed = true
+        if (!target.close()) fail("sink_failed", "the sink couldn't close")
+        return
     }
 
     fun fail(code: string, message: string): void {
@@ -298,7 +365,7 @@ class XmlWriter(
 
     fun lastWasDeclaration(): bool {
         val size = out.size()
-        size > 0 && out.byteAt(size - 1) == 10
+        if (size > 0) out.byteAt(size - 1) == 10 else lastFlushedByte == 10
     }
 
     fun closeTag(): bool = writePending(">")
@@ -370,7 +437,9 @@ class XmlWriter(
     // Writes markup that can't hold a character reference. Text in the
     // document's encoding, or an error when a character doesn't exist there.
     fun raw(value: string): bool {
-        if (encoding == xmlEncodingUtf8) {
+        var ascii = 0
+        while (ascii < value.size && value[ascii] < 0x80) ascii = ascii + 1
+        if (encoding == xmlEncodingUtf8 || ascii == value.size) {
             out.appendText(value)
             return true
         }
@@ -470,4 +539,16 @@ fun xmlWriter(options: XmlWriterOptions = XmlWriterOptions()): XmlWriter {
         i = i + 1
     }
     writer
+}
+
+// A writer that gives its encoded bytes to `sink` as it goes, holding only what it
+// needs for the open elements and up to about `flushBytes` of output.
+fun xmlStreamWriter(sink: XmlSink, options: XmlWriterOptions = XmlWriterOptions()): XmlWriter {
+    val writer = xmlWriter(options)
+    XmlWriter(
+        writer.encodingName, writer.encoding, writer.indent, byteBuffer(),
+        [], [], [], [], [], [], [], [],
+        errorCode = writer.errorCode, errorMessage = writer.errorMessage,
+        sink = sink, flushBytes = options.flushBytes
+    )
 }

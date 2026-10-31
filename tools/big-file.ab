@@ -1,0 +1,72 @@
+// Writes or reads a generated document of any size through a file, for measuring what
+// a program holds with /usr/bin/time -v. Local only: see `make big`.
+//   big-file write <path> <bytes> [encoding]
+//   big-file read <path>
+import "../src/xml.ab"
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+
+fun parseCount(text: string): int {
+    var value = 0
+    for (b in text) value = value * 10 + (b - 48)
+    value
+}
+
+fun write(target: string, bytes: int, encoding: string): int {
+    val w = xmlStreamWriter(xmlFileSink(Path(target)), XmlWriterOptions(encoding = encoding, indent = " "))
+    w.declaration()
+    w.startElement("r")
+    w.namespace("", "urn:big")
+    var i = 0
+    var written = 0
+    while (written < bytes) {
+        w.startElement("item")
+        w.attribute("id", "$i")
+        w.attribute("class", "a&b \"quoted\"")
+        w.element("name", "Açúcar é bom & barato $i")
+        w.element("note", "Some ordinary text of an ordinary length, with an € and 世界")
+        w.comment(" row $i ")
+        w.endElement()
+        i = i + 1
+        written = w.flushed
+    }
+    w.endElement()
+    val result = w.finish()
+    if (!result.succeeded) {
+        eprintln(result.errorMessage)
+        return 1
+    }
+    println("wrote ${result.bytesWritten} bytes, $i items")
+    0
+}
+
+fun read(source: string): int {
+    val r = xmlChunkedReader(xmlFileSource(Path(source)), XmlOptions(maxBytes = 1099511627776, maxNodes = 1099511627776))
+    var starts = 0
+    var texts = 0
+    var bytes = 0
+    while (true) {
+        val event = r.next()
+        if (event.kind == xmlEventEndOfDocument) break
+        if (event.kind == xmlEventError) {
+            val problem = r.error
+            if (problem != null) eprintln("${problem.code} at ${problem.line}:${problem.column}: ${problem.message}")
+            return 1
+        }
+        if (event.kind == xmlEventStart) starts = starts + 1
+        if (event.kind == xmlEventText) {
+            texts = texts + 1
+            bytes = bytes + event.value.size
+        }
+    }
+    println("read $starts elements, $texts texts, $bytes text bytes")
+    0
+}
+
+fun main: int {
+    if (processArgument(0) == "write") return write(processArgument(1), parseCount(processArgument(2)), if (processArgumentCount() > 3) processArgument(3) else "UTF-8")
+    if (processArgument(0) == "read") return read(processArgument(1))
+    eprintln("usage: big-file write <path> <bytes> [encoding] | big-file read <path>")
+    2
+}
