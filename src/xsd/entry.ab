@@ -1,0 +1,7 @@
+// XML Schema validation: `import github("AndreBaltazar8/abla-xml/xsd")`. See the README.
+import "../xml.ab"
+import "regex.ab"
+import "values.ab"
+import "xpath.ab"
+import "schema.ab"
+import "validate.ab"

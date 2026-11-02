@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.0
+
+- Add XML Schema validation, `import github("AndreBaltazar8/abla-xml/xsd")`: `xsdLoad`, `xsdValidate`,
+  `xsdValidateSource`. XSD 1.1 with assertions in a subset of XPath 2.0, repeating `xs:all`, identity
+  constraints and every facet, streaming, and bounded; what it doesn't implement is refused when the
+  schema loads. See the README for what is in and what is out.
+- Reading Windows-1252, ISO-8859-1 or US-ASCII takes runs of ASCII at once: a 126 MB file reads in
+  4.9 s instead of 8.2.
+
 ## 0.2.0
 
 - Add `xmlStreamWriter(sink, options)`: the writer's bytes go to an `XmlSink` as they are

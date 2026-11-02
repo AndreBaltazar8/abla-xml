@@ -1,0 +1,701 @@
+// The part of XPath 2.0 that XSD 1.1 assertions are written in here, over the typed tree of
+// the element an assertion belongs to, and the restricted XPath of identity constraints.
+// What isn't listed is refused when the schema is loaded, never skipped:
+//
+//   Expr     ::= 'if' '(' Expr ')' 'then' Expr 'else' Expr | Or
+//   Or       ::= And ('or' And)*
+//   And      ::= Compare ('and' Compare)*
+//   Compare  ::= Primary (('=' | '!=' | '<' | '<=' | '>' | '>=' | 'eq' | 'ne' | 'lt' | 'le' | 'gt' | 'ge') Primary)?
+//   Primary  ::= Literal | '(' Expr ')' | Call | Path
+//   Call     ::= ('fn:')? ('not' | 'true' | 'false' | 'exists' | 'empty' | 'boolean' | 'count') '(' Expr? ')'
+//   Path     ::= Step ('/' Step)*        Step ::= '.' | '..' | NameTest     NameTest ::= QName | '*' | prefix ':*'
+//
+// Literals are strings and integer or decimal numbers. As XSD 1.1 says, the tree is the
+// element's own: `..` from it is the empty sequence.
+import "abla/text"
+import "../chars.ab"
+import "values.ab"
+
+// An element of the typed tree an assertion sees: `primitive` -1 when its content is
+// elements only, so it has no typed value.
+class XsdNode(
+    var namespace: string,
+    var localName: string,
+    var primitive: int,
+    var text: string,
+    val children: array<int>,
+    var parent: int,
+    var line: int,
+    var column: int
+)
+
+// `root` is the element an assertion belongs to: nothing is above it.
+// Its nodes are nodes[0 until size]; the others are kept to be used again.
+class XsdTree(val nodes: array<XsdNode>, var root: int = -1, var size: int = 0) {
+    fun add(namespace: string, localName: string, parent: int, line: int, column: int): int {
+        if (size == nodes.size) nodes.append(XsdNode("", "", -1, "", [], -1, 0, 0))
+        val at = size
+        nodes[at].namespace = namespace
+        nodes[at].localName = localName
+        nodes[at].primitive = -1
+        nodes[at].text = ""
+        nodes[at].children.clear()
+        nodes[at].parent = parent
+        nodes[at].line = line
+        nodes[at].column = column
+        size = at + 1
+        if (parent >= 0) nodes[parent].children.append(at)
+        at
+    }
+}
+
+sealed interface XsdExpr
+class XsdExprIf(val condition: XsdExpr, val then: XsdExpr, val otherwise: XsdExpr) : XsdExpr
+class XsdExprOr(val left: XsdExpr, val right: XsdExpr) : XsdExpr
+class XsdExprAnd(val left: XsdExpr, val right: XsdExpr) : XsdExpr
+// `op` is one of the comparison constants below; `general` for = != < <= > >=.
+class XsdExprCompare(val op: int, val general: bool, val left: XsdExpr, val right: XsdExpr) : XsdExpr
+class XsdExprLiteral(val primitive: int, val text: string) : XsdExpr
+class XsdExprCall(val name: string, val arguments: array<XsdExpr>) : XsdExpr
+class XsdExprPath(val steps: array<XsdStep>) : XsdExpr
+
+// `kind` 0 self, 1 parent, 2 child, 3 attribute. A name test's namespace or local name is
+// "*" for any.
+class XsdStep(val kind: int, val namespace: string, val localName: string)
+
+val xsdStepSelf = 0
+val xsdStepParent = 1
+val xsdStepChild = 2
+val xsdStepAttribute = 3
+
+private val CMP_EQ = 0
+private val CMP_NE = 1
+private val CMP_LT = 2
+private val CMP_LE = 3
+private val CMP_GT = 4
+private val CMP_GE = 5
+
+// In-scope prefixes for names in an expression.
+class XsdPrefixes(val prefixes: array<string>, val uris: array<string>) {
+    // The namespace of `prefix`, or null when it isn't declared. "" is the default
+    // namespace for element names in XPath, which is none unless a schema says otherwise.
+    fun lookup(prefix: string): string? {
+        var i = prefixes.size - 1
+        while (i >= 0) {
+            if (prefixes[i] == prefix) return uris[i]
+            i = i - 1
+        }
+        if (prefix == "xml") return xmlNamespaceXml
+        null
+    }
+}
+
+// A token: `kind` 0 end, 1 name (QName or prefix:*), 2 string, 3 number, 4 symbol.
+class XsdToken(val kind: int, val text: string, val at: int)
+
+private fun xsdXpathNameChar(c: int, first: bool): bool =
+    (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95 || c >= 128 ||
+    (!first && ((c >= 48 && c <= 57) || c == 45 || c == 46))
+
+fun xsdXpathTokens(text: string): array<XsdToken> {
+    val tokens: array<XsdToken> = []
+    var i = 0
+    while (i < text.size) {
+        val c = text[i]
+        if (c == 32 || c == 9 || c == 10 || c == 13) {
+            i = i + 1
+            continue
+        }
+        val start = i
+        if (c == 39 || c == 34) {
+            // A quote doubled is the quote itself.
+            val parts = xsdQuotedAt(text, i, c)
+            if (parts.at < 0) {
+                tokens.append(XsdToken(-1, "an unterminated string", start))
+                return tokens
+            }
+            tokens.append(XsdToken(2, parts.text, start))
+            i = parts.at
+            continue
+        }
+        if ((c >= 48 && c <= 57) || (c == 46 && i + 1 < text.size && text[i + 1] >= 48 && text[i + 1] <= 57)) {
+            while (i < text.size && ((text[i] >= 48 && text[i] <= 57) || text[i] == 46)) i = i + 1
+            if (i < text.size && (text[i] == 101 || text[i] == 69)) {
+                tokens.append(XsdToken(-1, "a double literal", start))
+                return tokens
+            }
+            tokens.append(XsdToken(3, text.slice(start, i), start))
+            continue
+        }
+        if (xsdXpathNameChar(c, true)) {
+            while (i < text.size && xsdXpathNameChar(text[i], false)) i = i + 1
+            if (i + 1 < text.size && text[i] == 58 && text[i + 1] == 42) {
+                i = i + 2
+            } else if (i + 1 < text.size && text[i] == 58 && xsdXpathNameChar(text[i + 1], true)) {
+                i = i + 1
+                while (i < text.size && xsdXpathNameChar(text[i], false)) i = i + 1
+            }
+            // A trailing dot belongs to the name, as XML names allow, except "..".
+            tokens.append(XsdToken(1, text.slice(start, i), start))
+            continue
+        }
+        val two = if (i + 1 < text.size) text.slice(i, i + 2) else ""
+        if (two == "!=" || two == "<=" || two == ">=" || two == ".." || two == "//" || two == "::") {
+            tokens.append(XsdToken(4, two, start))
+            i = i + 2
+            continue
+        }
+        tokens.append(XsdToken(4, text.slice(i, i + 1), start))
+        i = i + 1
+    }
+    tokens.append(XsdToken(0, "", text.size))
+    tokens
+}
+
+class XsdQuoted(val text: string, val at: int)
+
+// The string literal starting at `start`, and where it ends; `at` -1 if it doesn't.
+private fun xsdQuotedAt(text: string, start: int, quote: int): XsdQuoted {
+    var out = ""
+    var i = start + 1
+    var from = i
+    while (i < text.size) {
+        if (text[i] == quote) {
+            if (i + 1 < text.size && text[i + 1] == quote) {
+                out = out + text.slice(from, i + 1)
+                i = i + 2
+                from = i
+                continue
+            }
+            out = out + text.slice(from, i)
+            return XsdQuoted(out, i + 1)
+        }
+        i = i + 1
+    }
+    XsdQuoted("", -1)
+}
+
+class XsdXpathParser(
+    val tokens: array<XsdToken>,
+    val prefixes: XsdPrefixes,
+    var pos: int = 0,
+    var error: string = ""
+) {
+    fun fail(message: string): XsdExpr {
+        if (error == "") error = "$message (at character ${tokens[pos].at + 1})"
+        XsdExprLiteral(xsdPrimitiveBoolean, "false")
+    }
+
+    fun peekText(): string = tokens[pos].text
+    fun peekKind(): int = tokens[pos].kind
+
+    fun isSymbol(text: string): bool = tokens[pos].kind == 4 && tokens[pos].text == text
+    fun isWord(text: string): bool = tokens[pos].kind == 1 && tokens[pos].text == text
+
+    fun expect(text: string): bool {
+        if (!isSymbol(text)) {
+            fail("expected $text")
+            return false
+        }
+        pos = pos + 1
+        true
+    }
+
+    fun expression(): XsdExpr {
+        if (isWord("if") && tokens[pos + 1].kind == 4 && tokens[pos + 1].text == "(") {
+            pos = pos + 1
+            expect("(")
+            val condition = expression()
+            expect(")")
+            if (!isWord("then")) return fail("expected then")
+            pos = pos + 1
+            val then = expression()
+            if (!isWord("else")) return fail("expected else")
+            pos = pos + 1
+            val otherwise = expression()
+            return XsdExprIf(condition, then, otherwise)
+        }
+        if (isWord("some") || isWord("every") || isWord("for") || isWord("let")) return fail("${peekText()} expressions aren't supported")
+        var left = andExpression()
+        while (error == "" && isWord("or")) {
+            pos = pos + 1
+            left = XsdExprOr(left, andExpression())
+        }
+        left
+    }
+
+    fun andExpression(): XsdExpr {
+        var left = comparison()
+        while (error == "" && isWord("and")) {
+            pos = pos + 1
+            left = XsdExprAnd(left, comparison())
+        }
+        left
+    }
+
+    fun comparison(): XsdExpr {
+        val left = primary()
+        if (error != "") return left
+        var op = -1
+        var general = true
+        val t = peekText()
+        if (peekKind() == 4) {
+            op = when (t) {
+                "=" -> CMP_EQ
+                "!=" -> CMP_NE
+                "<" -> CMP_LT
+                "<=" -> CMP_LE
+                ">" -> CMP_GT
+                ">=" -> CMP_GE
+                else -> -1
+            }
+        } else if (peekKind() == 1) {
+            general = false
+            op = when (t) {
+                "eq" -> CMP_EQ
+                "ne" -> CMP_NE
+                "lt" -> CMP_LT
+                "le" -> CMP_LE
+                "gt" -> CMP_GT
+                "ge" -> CMP_GE
+                else -> -1
+            }
+        }
+        if (op < 0) {
+            if (peekKind() == 4 && (t == "+" || t == "-" || t == "*" || t == "|" || t == "[" || t == "," || t == "//" || t == "@")) {
+                return fail("'$t' isn't supported here")
+            }
+            if (peekKind() == 1 && (t == "div" || t == "mod" || t == "idiv" || t == "to" || t == "union" || t == "intersect" || t == "except" || t == "is" || t == "instance" || t == "treat" || t == "castable" || t == "cast")) {
+                return fail("'$t' isn't supported")
+            }
+            return left
+        }
+        pos = pos + 1
+        val right = primary()
+        if (error == "" && peekKind() == 4 && (peekText() == "=" || peekText() == "!=" || peekText() == "<" || peekText() == ">")) return fail("comparisons don't chain")
+        XsdExprCompare(op, general, left, right)
+    }
+
+    fun primary(): XsdExpr {
+        val token = tokens[pos]
+        if (token.kind == -1) return fail("${token.text} isn't supported")
+        if (token.kind == 2) {
+            pos = pos + 1
+            return XsdExprLiteral(xsdPrimitiveString, token.text)
+        }
+        if (token.kind == 3) {
+            pos = pos + 1
+            val integer = token.text.indexOf(".") < 0
+            val parsed = xsdDecimalParse(token.text, integer)
+            if (!parsed.ok) return fail("${token.text} isn't a number")
+            return XsdExprLiteral(xsdPrimitiveDecimal, token.text)
+        }
+        if (token.kind == 4 && token.text == "(") {
+            pos = pos + 1
+            if (isSymbol(")")) return fail("the empty sequence () isn't supported")
+            val inner = expression()
+            expect(")")
+            return inner
+        }
+        if (token.kind == 1 && tokens[pos + 1].kind == 4 && tokens[pos + 1].text == "(") return call()
+        path()
+    }
+
+    fun call(): XsdExpr {
+        var name = peekText()
+        if (name.startsWith("fn:")) name = name.slice(3, name.size)
+        else if (name.indexOf(":") >= 0) return fail("the function $name isn't supported")
+        pos = pos + 2
+        val arguments: array<XsdExpr> = []
+        if (!isSymbol(")")) {
+            arguments.append(expression())
+            while (error == "" && isSymbol(",")) {
+                pos = pos + 1
+                arguments.append(expression())
+            }
+        }
+        expect(")")
+        val wanted = when (name) {
+            "true", "false" -> 0
+            "not", "exists", "empty", "boolean", "count" -> 1
+            else -> -1
+        }
+        if (wanted < 0) return fail("the function $name() isn't supported")
+        if (arguments.size != wanted) return fail("$name() takes $wanted arguments")
+        XsdExprCall(name, arguments)
+    }
+
+    fun step(): XsdStep? {
+        if (isSymbol(".")) {
+            pos = pos + 1
+            return XsdStep(xsdStepSelf, "", "")
+        }
+        if (isSymbol("..")) {
+            pos = pos + 1
+            return XsdStep(xsdStepParent, "", "")
+        }
+        var kind = xsdStepChild
+        if (isSymbol("@")) {
+            fail("attributes aren't supported in assertions")
+            return null
+        }
+        if (peekKind() == 1 && tokens[pos + 1].kind == 4 && tokens[pos + 1].text == "::") {
+            if (peekText() != "child") {
+                fail("the ${peekText()} axis isn't supported")
+                return null
+            }
+            pos = pos + 2
+        }
+        if (isSymbol("*")) {
+            pos = pos + 1
+            return XsdStep(kind, "*", "*")
+        }
+        if (peekKind() != 1) {
+            fail("expected a step")
+            return null
+        }
+        val name = peekText()
+        pos = pos + 1
+        if (name.endsWith(":*")) {
+            val uri = prefixes.lookup(name.slice(0, name.size - 2))
+            if (uri == null) {
+                fail("the prefix of $name isn't declared")
+                return null
+            }
+            return XsdStep(kind, uri, "*")
+        }
+        val colon = name.indexOf(":")
+        if (colon < 0) return XsdStep(kind, "", name)
+        val uri = prefixes.lookup(name.slice(0, colon))
+        if (uri == null) {
+            fail("the prefix of $name isn't declared")
+            return null
+        }
+        XsdStep(kind, uri, name.slice(colon + 1, name.size))
+    }
+
+    fun path(): XsdExpr {
+        if (isSymbol("/") || isSymbol("//")) return fail("absolute paths aren't supported")
+        val steps: array<XsdStep> = []
+        while (error == "") {
+            val s = step()
+            if (s == null) break
+            steps.append(s)
+            if (isSymbol("//")) return fail("// isn't supported")
+            if (isSymbol("[")) return fail("predicates aren't supported")
+            if (!isSymbol("/")) break
+            pos = pos + 1
+        }
+        XsdExprPath(steps)
+    }
+}
+
+class XsdCompiled(val expression: XsdExpr, val error: string)
+
+// Compiles an assertion's test. `error` says what isn't supported, or isn't XPath.
+fun xsdXpathCompile(text: string, prefixes: XsdPrefixes): XsdCompiled {
+    val parser = XsdXpathParser(xsdXpathTokens(text), prefixes)
+    val expression = parser.expression()
+    if (parser.error == "" && parser.peekKind() != 0) parser.fail("unexpected ${parser.peekText()}")
+    XsdCompiled(expression, parser.error)
+}
+
+// --- Evaluation ---------------------------------------------------------------------------
+
+class XsdAtom(val primitive: int, val text: string)
+
+// A sequence: nodes of the tree, or atomic values, and a dynamic error that ends the
+// evaluation, "" when none.
+class XsdSequence(val nodes: array<int>, val atoms: array<XsdAtom>, val error: string)
+
+private fun xsdErrorSequence(code: string): XsdSequence = XsdSequence([], [], code)
+private fun xsdBooleanSequence(value: bool): XsdSequence = XsdSequence([], [XsdAtom(xsdPrimitiveBoolean, if (value) "true" else "false")], "")
+
+class XsdBool(val value: bool, val error: string)
+
+private fun xsdIsNumeric(primitive: int): bool = primitive == xsdPrimitiveDecimal
+
+private fun xsdEffectiveBoolean(s: XsdSequence): XsdBool {
+    if (s.error != "") return XsdBool(false, s.error)
+    if (s.nodes.size > 0) return XsdBool(true, "")
+    if (s.atoms.size == 0) return XsdBool(false, "")
+    if (s.atoms.size > 1) return XsdBool(false, "FORG0006: the effective boolean value of several values")
+    val atom = s.atoms[0]
+    if (atom.primitive == xsdPrimitiveBoolean) return XsdBool(xsdBooleanValue(atom.text), "")
+    if (xsdPrimitiveIsStringLike(atom.primitive)) return XsdBool(atom.text.size > 0, "")
+    if (xsdIsNumeric(atom.primitive)) {
+        val d = xsdDecimalParse(atom.text)
+        return XsdBool(d.ok && (d.whole.size > 0 || d.fraction.size > 0), "")
+    }
+    XsdBool(false, "FORG0006: no effective boolean value")
+}
+
+class XsdAtoms(val atoms: array<XsdAtom>, val error: string)
+
+private fun xsdAtomize(tree: XsdTree, s: XsdSequence): XsdAtoms {
+    if (s.error != "") return XsdAtoms([], s.error)
+    val atoms: array<XsdAtom> = []
+    for (n in s.nodes) {
+        val node = tree.nodes[n]
+        if (node.primitive < 0) return XsdAtoms([], "FOTY0012: ${node.localName} has element-only content and no typed value")
+        atoms.append(XsdAtom(node.primitive, node.text))
+    }
+    for (a in s.atoms) atoms.append(a)
+    XsdAtoms(atoms, "")
+}
+
+class XsdOrder(val order: int, val error: string)
+
+// Compares two atoms for `op`; in a general comparison an untyped value takes the other's
+// type, in a value comparison it is a string.
+private fun xsdCompareAtoms(a: XsdAtom, b: XsdAtom, general: bool): XsdOrder {
+    var pa = a.primitive
+    var pb = b.primitive
+    if (pa == xsdPrimitiveUntyped || pb == xsdPrimitiveUntyped) {
+        if (!general || (pa == xsdPrimitiveUntyped && pb == xsdPrimitiveUntyped)) {
+            if (pa == xsdPrimitiveUntyped) pa = xsdPrimitiveString
+            if (pb == xsdPrimitiveUntyped) pb = xsdPrimitiveString
+        } else if (pa == xsdPrimitiveUntyped) {
+            pa = pb
+            if (!xsdLexicalOk(pa, a.text, false)) return XsdOrder(0, "FORG0001: '${a.text}' can't be cast for the comparison")
+        } else {
+            pb = pa
+            if (!xsdLexicalOk(pb, b.text, false)) return XsdOrder(0, "FORG0001: '${b.text}' can't be cast for the comparison")
+        }
+    }
+    if (xsdPrimitiveIsStringLike(pa) && xsdPrimitiveIsStringLike(pb)) {
+        if (a.text == b.text) return XsdOrder(0, "")
+        return XsdOrder(if (a.text < b.text) -1 else 1, "")
+    }
+    if (pa != pb) return XsdOrder(0, "XPTY0004: values of different types are compared")
+    if (xsdIsNumeric(pa)) {
+        val x = xsdDecimalParse(a.text)
+        val y = xsdDecimalParse(b.text)
+        if (!x.ok || !y.ok) return XsdOrder(0, "FORG0001: not a number")
+        return XsdOrder(xsdDecimalCompare(x, y), "")
+    }
+    val order = xsdCompareValues(pa, a.text, b.text)
+    if (order == 2) return XsdOrder(0, "XPTY0004: values that can't be compared")
+    XsdOrder(order, "")
+}
+
+private fun xsdHolds(op: int, order: int): bool = when (op) {
+    CMP_EQ -> order == 0
+    CMP_NE -> order != 0
+    CMP_LT -> order < 0
+    CMP_LE -> order <= 0
+    CMP_GT -> order > 0
+    else -> order >= 0
+}
+
+private fun xsdStepMatches(step: XsdStep, node: XsdNode): bool =
+    (step.localName == "*" || step.localName == node.localName) && (step.namespace == "*" || step.namespace == node.namespace)
+
+private fun xsdEvaluatePath(tree: XsdTree, context: int, steps: array<XsdStep>): XsdSequence {
+    var current: array<int> = [context]
+    for (step in steps) {
+        val next: array<int> = []
+        for (n in current) {
+            if (step.kind == xsdStepSelf) {
+                next.append(n)
+            } else if (step.kind == xsdStepParent) {
+                val parent = tree.nodes[n].parent
+                if (parent >= 0 && n != tree.root) next.append(parent)
+            } else {
+                for (child in tree.nodes[n].children) if (xsdStepMatches(step, tree.nodes[child])) next.append(child)
+            }
+        }
+        // Document order without duplicates: node numbers are in document order.
+        current = xsdSortedUnique(next)
+    }
+    XsdSequence(current, [], "")
+}
+
+private fun xsdSortedUnique(values: array<int>): array<int> {
+    val out: array<int> = []
+    var sorted = true
+    var i = 1
+    while (i < values.size) {
+        if (values[i] <= values[i - 1]) {
+            sorted = false
+            break
+        }
+        i = i + 1
+    }
+    if (sorted) {
+        for (v in values) out.append(v)
+        return out
+    }
+    for (v in values) {
+        var at = out.size
+        while (at > 0 && out[at - 1] > v) at = at - 1
+        if (at > 0 && out[at - 1] == v) continue
+        out.append(v)
+        var j = out.size - 1
+        while (j > at) {
+            out[j] = out[j - 1]
+            j = j - 1
+        }
+        out[at] = v
+    }
+    out
+}
+
+fun xsdEvaluate(tree: XsdTree, context: int, expression: XsdExpr): XsdSequence = when (expression) {
+    is XsdExprLiteral -> XsdSequence([], [XsdAtom(expression.primitive, expression.text)], "")
+    is XsdExprPath -> xsdEvaluatePath(tree, context, expression.steps)
+    is XsdExprIf -> {
+        val condition = xsdEffectiveBoolean(xsdEvaluate(tree, context, expression.condition))
+        if (condition.error != "") xsdErrorSequence(condition.error)
+        else if (condition.value) xsdEvaluate(tree, context, expression.then)
+        else xsdEvaluate(tree, context, expression.otherwise)
+    }
+    is XsdExprOr -> {
+        val left = xsdEffectiveBoolean(xsdEvaluate(tree, context, expression.left))
+        if (left.error != "") xsdErrorSequence(left.error)
+        else if (left.value) xsdBooleanSequence(true)
+        else {
+            val right = xsdEffectiveBoolean(xsdEvaluate(tree, context, expression.right))
+            if (right.error != "") xsdErrorSequence(right.error) else xsdBooleanSequence(right.value)
+        }
+    }
+    is XsdExprAnd -> {
+        val left = xsdEffectiveBoolean(xsdEvaluate(tree, context, expression.left))
+        if (left.error != "") xsdErrorSequence(left.error)
+        else if (!left.value) xsdBooleanSequence(false)
+        else {
+            val right = xsdEffectiveBoolean(xsdEvaluate(tree, context, expression.right))
+            if (right.error != "") xsdErrorSequence(right.error) else xsdBooleanSequence(right.value)
+        }
+    }
+    is XsdExprCompare -> xsdEvaluateCompare(tree, context, expression)
+    is XsdExprCall -> xsdEvaluateCall(tree, context, expression)
+}
+
+private fun xsdEvaluateCompare(tree: XsdTree, context: int, expression: XsdExprCompare): XsdSequence {
+    val left = xsdAtomize(tree, xsdEvaluate(tree, context, expression.left))
+    if (left.error != "") return xsdErrorSequence(left.error)
+    val right = xsdAtomize(tree, xsdEvaluate(tree, context, expression.right))
+    if (right.error != "") return xsdErrorSequence(right.error)
+    if (!expression.general) {
+        if (left.atoms.size == 0 || right.atoms.size == 0) return XsdSequence([], [], "")
+        if (left.atoms.size > 1 || right.atoms.size > 1) return xsdErrorSequence("XPTY0004: a value comparison of several values")
+        val order = xsdCompareAtoms(left.atoms[0], right.atoms[0], false)
+        if (order.error != "") return xsdErrorSequence(order.error)
+        return xsdBooleanSequence(xsdHolds(expression.op, order.order))
+    }
+    for (a in left.atoms) {
+        for (b in right.atoms) {
+            val order = xsdCompareAtoms(a, b, true)
+            if (order.error != "") return xsdErrorSequence(order.error)
+            if (xsdHolds(expression.op, order.order)) return xsdBooleanSequence(true)
+        }
+    }
+    xsdBooleanSequence(false)
+}
+
+private fun xsdEvaluateCall(tree: XsdTree, context: int, expression: XsdExprCall): XsdSequence {
+    if (expression.name == "true") return xsdBooleanSequence(true)
+    if (expression.name == "false") return xsdBooleanSequence(false)
+    val argument = xsdEvaluate(tree, context, expression.arguments[0])
+    if (argument.error != "") return argument
+    val size = argument.nodes.size + argument.atoms.size
+    when (expression.name) {
+        "exists" -> return xsdBooleanSequence(size > 0)
+        "empty" -> return xsdBooleanSequence(size == 0)
+        "count" -> return XsdSequence([], [XsdAtom(xsdPrimitiveDecimal, "$size")], "")
+        else -> {}
+    }
+    val value = xsdEffectiveBoolean(argument)
+    if (value.error != "") return xsdErrorSequence(value.error)
+    xsdBooleanSequence(if (expression.name == "not") !value.value else value.value)
+}
+
+// Whether an assertion holds on the tree's node `context`; the error that made it fail
+// when evaluation raised one.
+fun xsdAssertionHolds(tree: XsdTree, context: int, expression: XsdExpr): XsdBool =
+    xsdEffectiveBoolean(xsdEvaluate(tree, context, expression))
+
+// --- Identity constraint paths -----------------------------------------------------------
+
+// One alternative of a selector or field: `descendants` for a leading .//, then child steps
+// (self steps dropped), and for a field perhaps an attribute last.
+class XsdIdentityPath(val descendants: bool, val steps: array<XsdStep>, val attribute: XsdStep?)
+
+class XsdIdentityPaths(val paths: array<XsdIdentityPath>, val error: string)
+
+// XSD 1.1's Selector and Field grammars (section 3.11.6.2 and 3.11.6.3).
+fun xsdIdentityPathCompile(text: string, prefixes: XsdPrefixes, field: bool): XsdIdentityPaths {
+    val tokens = xsdXpathTokens(text)
+    val paths: array<XsdIdentityPath> = []
+    var pos = 0
+    while (true) {
+        var descendants = false
+        if (tokens[pos].kind == 4 && tokens[pos].text == "." && tokens[pos + 1].kind == 4 && tokens[pos + 1].text == "//") {
+            descendants = true
+            pos = pos + 2
+        }
+        val steps: array<XsdStep> = []
+        var attribute: XsdStep? = null
+        while (true) {
+            val t = tokens[pos]
+            if (t.kind == -1) return XsdIdentityPaths([], "${t.text} isn't allowed in $text")
+            var isAttribute = false
+            if (t.kind == 4 && t.text == "@") {
+                isAttribute = true
+                pos = pos + 1
+            } else if (t.kind == 1 && tokens[pos + 1].kind == 4 && tokens[pos + 1].text == "::") {
+                if (t.text == "attribute") isAttribute = true
+                else if (t.text != "child") return XsdIdentityPaths([], "the ${t.text} axis isn't allowed in $text")
+                pos = pos + 2
+            } else if (t.kind == 4 && t.text == ".") {
+                pos = pos + 1
+                if (!(tokens[pos].kind == 4 && tokens[pos].text == "/")) break
+                pos = pos + 1
+                continue
+            }
+            if (isAttribute && !field) return XsdIdentityPaths([], "a selector can't name an attribute: $text")
+            val n = tokens[pos]
+            var step: XsdStep? = null
+            val kind = if (isAttribute) xsdStepAttribute else xsdStepChild
+            if (n.kind == 4 && n.text == "*") {
+                step = XsdStep(kind, "*", "*")
+            } else if (n.kind == 1) {
+                val name = n.text
+                if (name.endsWith(":*")) {
+                    val uri = prefixes.lookup(name.slice(0, name.size - 2))
+                    if (uri == null) return XsdIdentityPaths([], "the prefix of $name isn't declared")
+                    step = XsdStep(kind, uri, "*")
+                } else {
+                    val colon = name.indexOf(":")
+                    if (colon < 0) {
+                        step = XsdStep(kind, "", name)
+                    } else {
+                        val uri = prefixes.lookup(name.slice(0, colon))
+                        if (uri == null) return XsdIdentityPaths([], "the prefix of $name isn't declared")
+                        step = XsdStep(kind, uri, name.slice(colon + 1, name.size))
+                    }
+                }
+            } else {
+                return XsdIdentityPaths([], "expected a name in $text")
+            }
+            pos = pos + 1
+            if (isAttribute) {
+                attribute = step
+                break
+            }
+            val chosen = step
+            if (chosen != null) steps.append(chosen)
+            if (!(tokens[pos].kind == 4 && tokens[pos].text == "/")) break
+            pos = pos + 1
+        }
+        paths.append(XsdIdentityPath(descendants, steps, attribute))
+        if (tokens[pos].kind == 4 && tokens[pos].text == "|") {
+            pos = pos + 1
+            continue
+        }
+        break
+    }
+    if (tokens[pos].kind != 0) return XsdIdentityPaths([], "unexpected ${tokens[pos].text} in $text")
+    XsdIdentityPaths(paths, "")
+}

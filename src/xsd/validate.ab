@@ -1,0 +1,764 @@
+// Validating a document against a loaded schema, in one pass over the reader's events, so a
+// document needn't fit in memory. What is held: the open elements, the typed tree of an
+// element with assertions while it is open, and the values identity constraints compare,
+// each bounded by XsdOptions.
+import "abla/text"
+import "abla/bytes"
+import "../chars.ab"
+import "../reader.ab"
+import "../encoding.ab"
+import "../tree.ab"
+import "regex.ab"
+import "values.ab"
+import "xpath.ab"
+import "schema.ab"
+
+class XsdOptions(
+    // The document's limits; a big document asks for more bytes and nodes, as with
+    // xmlChunkedReader.
+    val xml: XmlOptions = XmlOptions(),
+    // Errors kept; all are counted.
+    val maxErrors: int = 100,
+    // Values identity constraints hold at once, over the document.
+    val maxIdentityEntries: int = 16777216,
+    // Elements in the tree of one element with assertions.
+    val maxAssertionNodes: int = 1048576
+)
+
+// One way the document breaks the schema. `code` is content, value, attribute, assertion,
+// identity, unsupported, limit or xml (not well-formed). `path` names the element the broken
+// rule belongs to, without positions, as /root/child, and `elementLine` is where it starts: for a
+// child that doesn't fit, its parent; for an identity constraint, the element that declares it.
+// `line` and `column` are where the problem itself was found.
+class XsdError(val code: string, val message: string, val path: string, val elementLine: int, val line: int, val column: int)
+
+class XsdValidation(
+    val valid: bool,
+    val errors: array<XsdError>,
+    // Every error found, kept or not.
+    val errorCount: int,
+    // Set when the document isn't well-formed or broke a limit of XmlOptions; nothing after
+    // it was validated.
+    val xmlError: XmlError?,
+    val elements: int
+)
+
+// An open element. Frames are reused from one element to the next, so reading a big document
+// doesn't make one for each element.
+class XsdFrame(
+    var namespace: string,
+    var localName: string,
+    // The declaration, or -1 for an element that isn't validated (an error was reported).
+    var decl: int,
+    var typeKind: int,
+    var typeIndex: int,
+    var content: int,
+    var model: int,
+    val states: array<int>,
+    val counts: array<int>,
+    var text: string,
+    var nonSpace: bool,
+    var children: int,
+    var line: int,
+    var column: int,
+    // The node in the assertion tree, or -1.
+    var node: int,
+    // Identity fields this element's value fills: pairs of selection and field.
+    val fills: array<int>
+)
+
+// An identity constraint in effect under an element: its node table, and keyref values
+// that weren't in it when met.
+class XsdIdentityScope(
+    val identity: int,
+    val depth: int,
+    val table: Map<string, int>,
+    val pendingKeys: array<string>,
+    val pendingLines: array<int>,
+    val pendingColumns: array<int>
+)
+
+// An element a selector chose: its fields' keys as they are found.
+class XsdSelection(
+    val scope: int,
+    val depth: int,
+    val keys: array<string>,
+    val found: array<int>,
+    val line: int,
+    val column: int,
+    var live: bool
+)
+
+class XsdRun(
+    val options: XsdOptions,
+    // The open elements are frames[0 until open].
+    val frames: array<XsdFrame>,
+    var open: int,
+    // Automaton states being worked out.
+    val scratch: array<int>,
+    val errors: array<XsdError>,
+    var errorCount: int,
+    val scopes: array<XsdIdentityScope>,
+    val selections: array<XsdSelection>,
+    val tree: XsdTree,
+    val patternCache: Map<string, bool>,
+    var entries: int = 0,
+    var elements: int = 0,
+    var rootSeen: bool = false,
+    var stopped: bool = false
+) {
+    fun pathAt(depth: int): string {
+        val out = byteBuffer()
+        var i = 0
+        while (i <= depth && i < open) {
+            out.appendText("/")
+            out.appendText(frames[i].localName)
+            i = i + 1
+        }
+        out.toText()
+    }
+
+    fun report(code: string, message: string, depth: int, line: int, column: int): void {
+        errorCount = errorCount + 1
+        val elementLine = if (depth >= 0 && depth < open) frames[depth].line else line
+        if (errors.size < options.maxErrors) errors.append(XsdError(code, message, pathAt(depth), elementLine, line, column))
+        return
+    }
+
+    // --- Simple values ---
+
+    fun patternMatches(schema: XsdSchema, regex: int, value: string): bool {
+        val key = "$regex $value"
+        val cached = patternCache.get(key)
+        if (cached != null) return cached
+        val result = xsdRegexMatches(schema.regexes[regex], value)
+        if (patternCache.size >= 65536) patternCache.clear()
+        patternCache.set(key, result)
+        result
+    }
+
+    // Why `raw` isn't a value of the simple type, or "".
+    fun checkSimple(schema: XsdSchema, index: int, raw: string): string {
+        val t = schema.simpleTypes[index]
+        val value = xsdNormalizeWhitespace(raw, t.whitespace)
+        val typeName = if (t.name != "") t.name else "its type"
+        if (!xsdLexicalOk(t.primitive, value, t.integerOnly)) return "'$value' isn't a valid value of $typeName"
+        if (t.zoneRequired && !xsdMoment(t.primitive, value).zoned) return "'$value' needs a time zone"
+        if (t.length >= 0 || t.minLength >= 0 || t.maxLength >= 0) {
+            val size = if (t.primitive == xsdPrimitiveHex) value.size / 2 else if (t.primitive == xsdPrimitiveBase64) xsdBase64Octets(value) else xsdCodePoints(value)
+            if (t.length >= 0 && size != t.length) return "'$value' has length $size, not ${t.length}"
+            if (t.minLength >= 0 && size < t.minLength) return "'$value' is shorter than ${t.minLength}"
+            if (t.maxLength >= 0 && size > t.maxLength) return "'$value' is longer than ${t.maxLength}"
+        }
+        for (group in t.patterns) {
+            var any = false
+            for (regex in group) {
+                if (patternMatches(schema, regex, value)) {
+                    any = true
+                    break
+                }
+            }
+            if (!any) return "'$value' doesn't match the pattern ${schema.regexes[group[0]].source}${if (group.size > 1) " or the others" else ""}"
+        }
+        for (group in t.enumerations) {
+            var any = false
+            for (option in group) {
+                if (xsdCompareValues(t.primitive, value, option) == 0) {
+                    any = true
+                    break
+                }
+            }
+            if (!any) return "'$value' isn't one of the values ${textJoin(group, ", ")}"
+        }
+        if (t.minInclusive != "") {
+            val order = xsdCompareValues(t.primitive, value, t.minInclusive)
+            if (order != 0 && order != 1) return "'$value' is below the minimum ${t.minInclusive}"
+        }
+        if (t.maxInclusive != "") {
+            val order = xsdCompareValues(t.primitive, value, t.maxInclusive)
+            if (order != 0 && order != -1) return "'$value' is above the maximum ${t.maxInclusive}"
+        }
+        if (t.minExclusive != "" && xsdCompareValues(t.primitive, value, t.minExclusive) != 1) return "'$value' isn't above ${t.minExclusive}"
+        if (t.maxExclusive != "" && xsdCompareValues(t.primitive, value, t.maxExclusive) != -1) return "'$value' isn't below ${t.maxExclusive}"
+        if (t.totalDigits >= 0 || t.fractionDigits >= 0) {
+            val d = xsdDecimalParse(value)
+            if (t.totalDigits >= 0 && xsdDecimalTotalDigits(d) > t.totalDigits) return "'$value' has more than ${t.totalDigits} digits"
+            if (t.fractionDigits >= 0 && d.fraction.size > t.fractionDigits) return "'$value' has more than ${t.fractionDigits} fraction digits"
+        }
+        ""
+    }
+
+    // The simple type an element's value has, or -1 when its content isn't simple.
+    fun valueType(schema: XsdSchema, typeKind: int, typeIndex: int): int {
+        if (typeIndex < 0) return -1
+        if (typeKind == xsdTypeSimple) return typeIndex
+        if (schema.complexTypes[typeIndex].content == xsdContentSimple) schema.complexTypes[typeIndex].simpleType else -1
+    }
+
+    // --- Starting an element ---
+
+    fun start(schema: XsdSchema, event: XmlEvent): void {
+        elements = elements + 1
+        val depth = open
+        var decl = -1
+        var parentNode = -1
+        var undeclared = false
+        if (depth == 0) {
+            rootSeen = true
+            val found = schema.globalElements.get("${event.namespaceUri} ${event.localName}")
+            if (found == null) undeclared = true else decl = found
+        } else {
+            val parent = depth - 1
+            parentNode = frames[parent].node
+            frames[parent].children = frames[parent].children + 1
+            if (frames[parent].decl >= 0) decl = childDecl(schema, parent, event)
+        }
+        var typeKind = 0
+        var typeIndex = -1
+        var content = xsdContentEmpty
+        var model = -1
+        var hasAssertions = false
+        if (decl >= 0) {
+            typeKind = schema.elements[decl].typeKind
+            typeIndex = schema.elements[decl].typeIndex
+            if (typeKind == xsdTypeSimple) {
+                content = xsdContentSimple
+            } else if (typeIndex >= 0) {
+                content = schema.complexTypes[typeIndex].content
+                model = schema.complexTypes[typeIndex].model
+                hasAssertions = schema.complexTypes[typeIndex].assertions.size > 0
+            }
+        }
+        if (open == frames.size) frames.append(XsdFrame("", "", -1, 0, -1, 0, -1, [], [], "", false, 0, 0, 0, -1, []))
+        frames[depth].states.clear()
+        frames[depth].counts.clear()
+        frames[depth].fills.clear()
+        if (model >= 0) {
+            if (schema.models[model].all) {
+                for (d in schema.models[model].allDecls) frames[depth].counts.append(0)
+            } else {
+                for (s in schema.models[model].closure[schema.models[model].start]) frames[depth].states.append(s)
+            }
+        }
+        var node = -1
+        if ((hasAssertions || parentNode >= 0) && decl >= 0) {
+            if (tree.size >= options.maxAssertionNodes) {
+                report("limit", "an element with assertions holds more than ${options.maxAssertionNodes} elements", depth - 1, event.line, event.column)
+                stopped = true
+            } else {
+                node = tree.add(event.namespaceUri, event.localName, parentNode, event.line, event.column)
+            }
+        }
+        frames[depth].namespace = event.namespaceUri
+        frames[depth].localName = event.localName
+        frames[depth].decl = decl
+        frames[depth].typeKind = typeKind
+        frames[depth].typeIndex = typeIndex
+        frames[depth].content = content
+        frames[depth].model = model
+        frames[depth].text = ""
+        frames[depth].nonSpace = false
+        frames[depth].children = 0
+        frames[depth].line = event.line
+        frames[depth].column = event.column
+        frames[depth].node = node
+        open = depth + 1
+        if (undeclared) report("content", "no global element declares ${event.localName}${if (event.namespaceUri != "") " in ${event.namespaceUri}" else " without a namespace"}", 0, event.line, event.column)
+        if (decl >= 0) attributes(schema, depth, event)
+        identityStart(schema, depth, event)
+        return
+    }
+
+    // The declaration a child takes in its parent's content model, or -1 after reporting.
+    fun childDecl(schema: XsdSchema, parent: int, event: XmlEvent): int {
+        val content = frames[parent].content
+        if (content == xsdContentSimple || content == xsdContentEmpty) {
+            report("content", "${frames[parent].localName} can't hold the element ${event.localName}: its content is ${if (content == xsdContentSimple) "simple" else "empty"}", parent, event.line, event.column)
+            return -1
+        }
+        val model = frames[parent].model
+        if (model < 0) return -1
+        if (schema.models[model].all) {
+            var i = 0
+            while (i < schema.models[model].allDecls.size) {
+                val d = schema.models[model].allDecls[i]
+                if (schema.elements[d].name == event.localName && schema.elements[d].namespace == event.namespaceUri) {
+                    val count = frames[parent].counts[i] + 1
+                    frames[parent].counts[i] = count
+                    val max = schema.models[model].allMax[i]
+                    if (max >= 0 && count > max) {
+                        report("content", "${event.localName} occurs more than $max times in ${frames[parent].localName}", parent, event.line, event.column)
+                        return -1
+                    }
+                    return d
+                }
+                i = i + 1
+            }
+            report("content", "unexpected element ${event.localName} in ${frames[parent].localName}", parent, event.line, event.column)
+            return -1
+        }
+        scratch.clear()
+        var decl = -1
+        for (s in frames[parent].states) {
+            var k = 0
+            while (k < schema.models[model].edgeDecl[s].size) {
+                val d = schema.models[model].edgeDecl[s][k]
+                if (schema.elements[d].name == event.localName && schema.elements[d].namespace == event.namespaceUri) {
+                    if (decl >= 0 && decl != d && (schema.elements[d].typeKind != schema.elements[decl].typeKind || schema.elements[d].typeIndex != schema.elements[decl].typeIndex)) {
+                        report("unsupported", "${event.localName} matches two declarations of different types (the schema isn't deterministic)", parent, event.line, event.column)
+                        return -1
+                    }
+                    decl = d
+                    for (reached in schema.models[model].closure[schema.models[model].edgeTo[s][k]]) {
+                        var seen = false
+                        for (n in scratch) if (n == reached) { seen = true; break }
+                        if (!seen) scratch.append(reached)
+                    }
+                }
+                k = k + 1
+            }
+        }
+        if (decl < 0) {
+            report("content", "unexpected element ${event.localName} in ${frames[parent].localName}${expected(schema, model, frames[parent].states)}", parent, event.line, event.column)
+            return -1
+        }
+        frames[parent].states.clear()
+        for (n in scratch) frames[parent].states.append(n)
+        decl
+    }
+
+    // ", expected A or B", from these states, or "" when the content may end.
+    fun expected(schema: XsdSchema, model: int, states: array<int>): string {
+        val names: array<string> = []
+        for (s in states) {
+            for (d in schema.models[model].edgeDecl[s]) {
+                val name = schema.elements[d].name
+                var seen = false
+                for (n in names) if (n == name) seen = true
+                if (!seen) names.append(name)
+            }
+        }
+        if (names.size == 0) return ""
+        ", expected ${textJoin(names, " or ")}"
+    }
+
+    fun attributes(schema: XsdSchema, depth: int, event: XmlEvent): void {
+        val typeIndex = frames[depth].typeIndex
+        val seen: array<bool> = []
+        val complex = frames[depth].typeKind == xsdTypeComplex && typeIndex >= 0
+        if (complex) for (u in schema.complexTypes[typeIndex].attributes) seen.append(false)
+        for (a in event.attributes) {
+            if (a.namespaceUri == xmlNamespaceXmlns) continue
+            if (a.namespaceUri == xsdInstanceNamespace) {
+                if (a.localName == "schemaLocation" || a.localName == "noNamespaceSchemaLocation") continue
+                report("unsupported", "xsi:${a.localName} isn't supported", depth, event.line, event.column)
+                continue
+            }
+            var matched = -1
+            if (complex) {
+                var i = 0
+                while (i < schema.complexTypes[typeIndex].attributes.size) {
+                    val u = schema.complexTypes[typeIndex].attributes[i]
+                    if (u.name == a.localName && u.namespace == a.namespaceUri) {
+                        matched = i
+                        break
+                    }
+                    i = i + 1
+                }
+            }
+            if (matched < 0) {
+                report("attribute", "the attribute ${a.name} isn't allowed on ${event.localName}", depth, event.line, event.column)
+                continue
+            }
+            seen[matched] = true
+            val u = schema.complexTypes[typeIndex].attributes[matched]
+            val problem = checkSimple(schema, u.simpleType, a.value)
+            if (problem != "") {
+                report("attribute", "the attribute ${a.name}: $problem", depth, event.line, event.column)
+            } else if (u.hasFixed) {
+                val t = schema.simpleTypes[u.simpleType]
+                if (xsdCompareValues(t.primitive, xsdNormalizeWhitespace(a.value, t.whitespace), xsdNormalizeWhitespace(u.fixed, t.whitespace)) != 0) {
+                    report("attribute", "the attribute ${a.name} must be '${u.fixed}'", depth, event.line, event.column)
+                }
+            }
+        }
+        if (complex) {
+            var i = 0
+            while (i < seen.size) {
+                if (!seen[i] && schema.complexTypes[typeIndex].attributes[i].required) {
+                    report("attribute", "the attribute ${schema.complexTypes[typeIndex].attributes[i].name} is required on ${event.localName}", depth, event.line, event.column)
+                }
+                i = i + 1
+            }
+        }
+        return
+    }
+
+    // --- Text ---
+
+    fun text(value: string, event: XmlEvent): void {
+        if (open == 0) return
+        val top = open - 1
+        val content = frames[top].content
+        if (frames[top].decl < 0) return
+        var space = true
+        for (c in value) if (!(c == 32 || c == 9 || c == 10 || c == 13)) { space = false; break }
+        if (content == xsdContentSimple || content == xsdContentMixed) {
+            frames[top].text = frames[top].text + value
+        } else if (!space || content == xsdContentEmpty) {
+            if (!frames[top].nonSpace) {
+                frames[top].nonSpace = true
+                if (content == xsdContentEmpty && value.size > 0) report("content", "${frames[top].localName} must be empty", top, event.line, event.column)
+                else if (!space) report("content", "${frames[top].localName} can't hold text, only elements", top, event.line, event.column)
+            }
+        }
+        return
+    }
+
+    // --- Ending an element ---
+
+    fun end(schema: XsdSchema, event: XmlEvent): void {
+        val depth = open - 1
+        val decl = frames[depth].decl
+        val model = frames[depth].model
+        val typeKind = frames[depth].typeKind
+        val typeIndex = frames[depth].typeIndex
+        val content = frames[depth].content
+        val text = frames[depth].text
+        val localName = frames[depth].localName
+        val line = frames[depth].line
+        val column = frames[depth].column
+        val node = frames[depth].node
+        val children = frames[depth].children
+        var keyPrimitive = xsdPrimitiveUntyped
+        var keyValue = text
+        var keyOk = false
+        if (decl >= 0) {
+            if (model >= 0) {
+                if (schema.models[model].all) {
+                    var i = 0
+                    var any = false
+                    for (c in frames[depth].counts) if (c > 0) any = true
+                    if (any || !schema.models[model].allOptional) {
+                        while (i < frames[depth].counts.size) {
+                            if (frames[depth].counts[i] < schema.models[model].allMin[i]) {
+                                report("content", "${localName} is incomplete: it needs ${schema.elements[schema.models[model].allDecls[i]].name}", depth, line, column)
+                                break
+                            }
+                            i = i + 1
+                        }
+                    }
+                } else {
+                    var done = false
+                    for (s in frames[depth].states) if (s == schema.models[model].accept) done = true
+                    if (!done) report("content", "${localName} is incomplete${expected(schema, model, frames[depth].states)}", depth, line, column)
+                }
+            }
+            val simple = valueType(schema, typeKind, typeIndex)
+            if (simple >= 0) {
+                var raw = text
+                val d = schema.elements[decl]
+                if (raw == "" && children == 0 && (d.hasDefault || d.hasFixed)) raw = if (d.hasFixed) d.valueFixed else d.valueDefault
+                val problem = checkSimple(schema, simple, raw)
+                if (problem != "") {
+                    report("value", "${localName}: $problem", depth, line, column)
+                } else {
+                    keyOk = true
+                    if (d.hasFixed) {
+                        val t = schema.simpleTypes[simple]
+                        if (xsdCompareValues(t.primitive, xsdNormalizeWhitespace(raw, t.whitespace), xsdNormalizeWhitespace(d.valueFixed, t.whitespace)) != 0) {
+                            report("value", "${localName} must be '${d.valueFixed}'", depth, line, column)
+                        }
+                    }
+                }
+                keyPrimitive = schema.simpleTypes[simple].primitive
+                keyValue = xsdNormalizeWhitespace(raw, schema.simpleTypes[simple].whitespace)
+            }
+            if (node >= 0) {
+                if (simple >= 0) {
+                    tree.nodes[node].primitive = keyPrimitive
+                    tree.nodes[node].text = keyValue
+                } else if (content == xsdContentMixed) {
+                    tree.nodes[node].primitive = xsdPrimitiveUntyped
+                    tree.nodes[node].text = text
+                }
+            }
+            if (typeKind == xsdTypeComplex && typeIndex >= 0 && node >= 0) {
+                for (assertion in schema.complexTypes[typeIndex].assertions) {
+                    tree.root = node
+                    val held = xsdAssertionHolds(tree, node, assertion.expression)
+                    if (!held.value) {
+                        report("assertion", "${localName}: the assertion of line ${assertion.line} is false${if (held.error != "") " (${held.error})" else ""}: ${assertion.test}", depth, line, column)
+                    }
+                }
+            }
+            if (node >= 0 && (depth == 0 || frames[depth - 1].node < 0)) tree.size = 0
+        }
+        identityEnd(schema, depth, keyOk, keyPrimitive, keyValue, line, column)
+        open = depth
+        return
+    }
+
+    // --- Identity constraints ---
+
+    fun pathMatches(paths: array<XsdIdentityPath>, from: int, to: int): bool {
+        for (p in paths) {
+            val length = to - from
+            if (p.descendants) {
+                if (length < p.steps.size) continue
+            } else if (length != p.steps.size) {
+                continue
+            }
+            var ok = true
+            var i = 0
+            while (i < p.steps.size) {
+                val f = frames[to - p.steps.size + 1 + i]
+                val s = p.steps[i]
+                if ((s.localName != "*" && s.localName != f.localName) || (s.namespace != "*" && s.namespace != f.namespace)) {
+                    ok = false
+                    break
+                }
+                i = i + 1
+            }
+            if (ok && p.attribute == null) return true
+        }
+        false
+    }
+
+    fun identityStart(schema: XsdSchema, depth: int, event: XmlEvent): void {
+        val decl = frames[depth].decl
+        if (decl >= 0) {
+            for (identity in schema.elements[decl].identities) {
+                scopes.append(XsdIdentityScope(identity, depth, Map(), [], [], []))
+            }
+        }
+        // Selectors: this element, relative to each scope's element.
+        var s = if (schema.selectorNames.has(event.localName) || schema.selectorNames.has("*")) 0 else scopes.size
+        while (s < scopes.size) {
+            if (scopes[s].depth <= depth) {
+                if (pathMatches(schema.identities[scopes[s].identity].selector, scopes[s].depth, depth)) {
+                    val fields = schema.identities[scopes[s].identity].fields.size
+                    val keys: array<string> = []
+                    val found: array<int> = []
+                    var i = 0
+                    while (i < fields) {
+                        keys.append("")
+                        found.append(0)
+                        i = i + 1
+                    }
+                    selections.append(XsdSelection(s, depth, keys, found, event.line, event.column, true))
+                }
+            }
+            s = s + 1
+        }
+        // Fields: this element or its attributes, relative to each open selection.
+        var k = 0
+        while (k < selections.size) {
+            if (selections[k].live) {
+                val fields = schema.identities[scopes[selections[k].scope].identity].fields
+                var i = 0
+                while (i < fields.size) {
+                    if (pathMatches(fields[i], selections[k].depth, depth)) {
+                        frames[depth].fills.append(k)
+                        frames[depth].fills.append(i)
+                    }
+                    for (p in fields[i]) {
+                        val attribute = p.attribute
+                        if (attribute == null) continue
+                        if (!pathMatchesSteps(p, selections[k].depth, depth)) continue
+                        for (a in event.attributes) {
+                            if (a.namespaceUri == xmlNamespaceXmlns) continue
+                            if ((attribute.localName == "*" || attribute.localName == a.localName) && (attribute.namespace == "*" || attribute.namespace == a.namespaceUri)) {
+                                fieldValue(schema, k, i, attributeKey(schema, depth, a), depth, event.line, event.column)
+                            }
+                        }
+                    }
+                    i = i + 1
+                }
+            }
+            k = k + 1
+        }
+        return
+    }
+
+    fun pathMatchesSteps(p: XsdIdentityPath, from: int, to: int): bool {
+        val length = to - from
+        if (p.descendants) {
+            if (length < p.steps.size) return false
+        } else if (length != p.steps.size) {
+            return false
+        }
+        var i = 0
+        while (i < p.steps.size) {
+            val f = frames[to - p.steps.size + 1 + i]
+            val s = p.steps[i]
+            if ((s.localName != "*" && s.localName != f.localName) || (s.namespace != "*" && s.namespace != f.namespace)) return false
+            i = i + 1
+        }
+        true
+    }
+
+    // An attribute's key, typed by its declaration.
+    fun attributeKey(schema: XsdSchema, depth: int, a: XmlAttribute): string {
+        val f = frames[depth]
+        if (f.typeKind == xsdTypeComplex && f.typeIndex >= 0) {
+            for (u in schema.complexTypes[f.typeIndex].attributes) {
+                if (u.name == a.localName && u.namespace == a.namespaceUri) {
+                    val t = schema.simpleTypes[u.simpleType]
+                    return xsdValueKey(t.primitive, xsdNormalizeWhitespace(a.value, t.whitespace))
+                }
+            }
+        }
+        xsdValueKey(xsdPrimitiveUntyped, a.value)
+    }
+
+    fun fieldValue(schema: XsdSchema, selection: int, field: int, key: string, depth: int, line: int, column: int): void {
+        if (selections[selection].found[field] > 0) {
+            val identity = schema.identities[scopes[selections[selection].scope].identity]
+            report("identity", "a field of ${identity.name} selects more than one value", depth, line, column)
+        }
+        selections[selection].found[field] = selections[selection].found[field] + 1
+        selections[selection].keys[field] = key
+        return
+    }
+
+    fun identityEnd(schema: XsdSchema, depth: int, keyOk: bool, primitive: int, value: string, line: int, column: int): void {
+        // This element's value into the fields it fills.
+        var i = 0
+        while (i < frames[depth].fills.size) {
+            val k = frames[depth].fills[i]
+            val field = frames[depth].fills[i + 1]
+            if (frames[depth].content != xsdContentSimple) {
+                val identity = schema.identities[scopes[selections[k].scope].identity]
+                report("identity", "a field of ${identity.name} selects ${frames[depth].localName}, which has no simple value", depth, line, column)
+            } else {
+                fieldValue(schema, k, field, if (keyOk) xsdValueKey(primitive, value) else xsdValueKey(xsdPrimitiveUntyped, value), depth, line, column)
+            }
+            i = i + 2
+        }
+        // Selections of this element are complete.
+        while (selections.size > 0 && selections[selections.size - 1].depth == depth) {
+            val k = selections.size - 1
+            if (selections[k].live) finishSelection(schema, k)
+            selections.truncate(k)
+        }
+        // Scopes of this element end: keyrefs not found by now are errors.
+        while (scopes.size > 0 && scopes[scopes.size - 1].depth == depth) {
+            val s = scopes.size - 1
+            val identity = schema.identities[scopes[s].identity]
+            if (identity.kind == xsdIdentityKeyref) {
+                val target = scopeOf(identity.refer, depth)
+                var p = 0
+                while (p < scopes[s].pendingKeys.size) {
+                    if (target < 0 || !scopes[target].table.has(scopes[s].pendingKeys[p])) {
+                        report("identity", "${identity.name}: the value ${shown(scopes[s].pendingKeys[p])} of line ${scopes[s].pendingLines[p]} isn't a key of ${schema.identities[identity.refer].name}", depth, frames[depth].line, frames[depth].column)
+                    }
+                    p = p + 1
+                }
+            }
+            entries = entries - scopes[s].table.size - scopes[s].pendingKeys.size
+            scopes.truncate(s)
+        }
+        return
+    }
+
+    // The scope of `identity` on the element at `depth`, or -1.
+    fun scopeOf(identity: int, depth: int): int {
+        var s = scopes.size - 1
+        while (s >= 0) {
+            if (scopes[s].identity == identity && scopes[s].depth == depth) return s
+            s = s - 1
+        }
+        -1
+    }
+
+    fun shown(key: string): string {
+        val parts = key.split("\u0001")
+        val out: array<string> = []
+        for (part in parts) {
+            val colon = part.indexOf(":")
+            out.append("'${if (colon >= 0) part.slice(colon + 1, part.size) else part}'")
+        }
+        textJoin(out, ", ")
+    }
+
+    fun finishSelection(schema: XsdSchema, k: int): void {
+        val s = selections[k].scope
+        val identity = schema.identities[scopes[s].identity]
+        var complete = true
+        for (count in selections[k].found) if (count == 0) complete = false
+        val depth = selections[k].depth
+        if (!complete) {
+            if (identity.kind == xsdIdentityKey) report("identity", "${identity.name}: a field is missing", depth, selections[k].line, selections[k].column)
+            return
+        }
+        val key = textJoin(selections[k].keys, "\u0001")
+        if (identity.kind == xsdIdentityKeyref) {
+            val target = scopeOf(identity.refer, scopes[s].depth)
+            if (target >= 0 && scopes[target].table.has(key)) return
+            if (entries >= options.maxIdentityEntries) {
+                limit(depth, selections[k].line, selections[k].column)
+                return
+            }
+            entries = entries + 1
+            scopes[s].pendingKeys.append(key)
+            scopes[s].pendingLines.append(selections[k].line)
+            scopes[s].pendingColumns.append(selections[k].column)
+            return
+        }
+        val earlier = scopes[s].table.get(key)
+        if (earlier != null) {
+            report("identity", "${identity.name}: the value ${shown(key)} is a duplicate of line $earlier", depth, selections[k].line, selections[k].column)
+            return
+        }
+        if (entries >= options.maxIdentityEntries) {
+            limit(depth, selections[k].line, selections[k].column)
+            return
+        }
+        entries = entries + 1
+        scopes[s].table.set(key, selections[k].line)
+        return
+    }
+
+    fun limit(depth: int, line: int, column: int): void {
+        report("limit", "identity constraints hold more than ${options.maxIdentityEntries} values", depth, line, column)
+        stopped = true
+        return
+    }
+}
+
+fun xsdRun(options: XsdOptions): XsdRun = XsdRun(options, [], 0, [], [], 0, [], [], XsdTree([], -1, 0), Map())
+
+// Validates the events of `reader` against the schema.
+fun xsdValidateReader(schema: XsdSchema, var reader: XmlReader, options: XsdOptions = XsdOptions()): XsdValidation {
+    val run = xsdRun(options)
+    var xmlError: XmlError? = null
+    while (!run.stopped) {
+        val event = reader.next()
+        val kind = event.kind
+        if (kind == xmlEventStart) run.start(schema, event)
+        else if (kind == xmlEventEnd) run.end(schema, event)
+        else if (kind == xmlEventText || kind == xmlEventCdata) run.text(event.value, event)
+        else if (kind == xmlEventSkippedEntity) {
+            if (run.open > 0) run.report("unsupported", "the entity ${event.name} wasn't read, so the content can't be validated", run.open - 1, event.line, event.column)
+        } else if (kind == xmlEventError) {
+            xmlError = reader.error
+            val e = reader.error
+            if (e != null) run.report("xml", "${e.code}: ${e.message}", run.open - 1, e.line, e.column)
+            break
+        } else if (kind == xmlEventEndOfDocument) {
+            break
+        }
+    }
+    if (run.stopped) reader.closeSource()
+    if (!run.rootSeen && xmlError == null) run.report("content", "no root element", -1, 1, 1)
+    XsdValidation(run.errorCount == 0, run.errors, run.errorCount, xmlError, run.elements)
+}
+
+// Validates a whole document held in memory.
+fun xsdValidate(schema: XsdSchema, document: string, options: XsdOptions = XsdOptions()): XsdValidation =
+    xsdValidateReader(schema, xmlReader(document, options.xml), options)
+
+// Validates a document read from `source` a piece at a time.
+fun xsdValidateSource(schema: XsdSchema, source: XmlSource, options: XsdOptions = XsdOptions()): XsdValidation =
+    xsdValidateReader(schema, xmlChunkedReader(source, options.xml), options)

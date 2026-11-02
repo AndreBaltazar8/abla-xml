@@ -1,0 +1,283 @@
+import "../src/xsd/entry.ab"
+import "abla/test"
+import "abla/text"
+import "abla/bytes"
+
+val head = "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:t=\"urn:t\" targetNamespace=\"urn:t\" elementFormDefault=\"qualified\">"
+
+fun schemaOf(body: string): XsdSchema? {
+    val loaded = xsdLoad("$head$body</xs:schema>")
+    if (loaded.error != "") expect(false, "the schema loads: ${loaded.error}")
+    loaded.schema
+}
+
+fun refused(body: string, why: string): void {
+    val loaded = xsdLoad("$head$body</xs:schema>")
+    expect(!loaded.succeeded, "refused: $why")
+    expect(loaded.error.contains(why), "the reason names $why: ${loaded.error}")
+    return
+}
+
+fun firstError(v: XsdValidation): string = if (v.errors.size > 0) "${v.errors[0].code} ${v.errors[0].path}: ${v.errors[0].message}" else ""
+
+fun valid(schema: XsdSchema?, document: string, label: string): void {
+    if (schema == null) return
+    val v = xsdValidate(schema, document)
+    expect(v.valid, "$label is valid: ${firstError(v)}")
+    // The same, read a few bytes at a time.
+    val streamed = xsdValidateSource(schema, xmlStringSource(document, 7))
+    expect(streamed.valid, "$label is valid read in pieces: ${firstError(streamed)}")
+    return
+}
+
+// Invalid, with the first error of `code` at `path`.
+fun invalid(schema: XsdSchema?, document: string, code: string, path: string, label: string): void {
+    if (schema == null) return
+    val v = xsdValidate(schema, document)
+    expect(!v.valid, "$label is invalid")
+    if (v.errors.size > 0) {
+        expectEqual(v.errors[0].code, code, "$label: the code (${v.errors[0].message})")
+        expectEqual(v.errors[0].path, path, "$label: the place (${v.errors[0].message})")
+    }
+    val streamed = xsdValidateSource(schema, xmlStringSource(document, 5))
+    expectEqual(streamed.errorCount, v.errorCount, "$label: the same errors read in pieces")
+    return
+}
+
+fun t(body: string): string = "<r xmlns=\"urn:t\">$body</r>"
+
+fun main: int {
+    // Models: sequences with bounds, choices, nested groups.
+    val models = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence>" +
+        "<xs:element name=\"a\" type=\"xs:string\" minOccurs=\"2\" maxOccurs=\"3\"/>" +
+        "<xs:choice minOccurs=\"0\"><xs:element name=\"b\" type=\"xs:int\"/><xs:element name=\"c\" type=\"xs:boolean\"/></xs:choice>" +
+        "<xs:sequence maxOccurs=\"unbounded\"><xs:element name=\"d\" type=\"xs:token\"/><xs:element name=\"e\" type=\"xs:token\" minOccurs=\"0\"/></xs:sequence>" +
+        "</xs:sequence></xs:complexType></xs:element>")
+    valid(models, t("<a/><a/><d/>"), "two a and a d")
+    valid(models, t("<a/><a/><a/><b>7</b><d/><e/><d/>"), "three a, b, d e d")
+    valid(models, t("\n  <a>x</a><!-- c --><a/><?p?><c>true</c><d/>\n"), "with space, comments and instructions")
+    invalid(models, t("<a/><d/>"), "content", "/r", "one a")
+    invalid(models, t("<a/><a/><a/><a/><d/>"), "content", "/r", "four a")
+    invalid(models, t("<a/><a/><b>1</b><c>1</c><d/>"), "content", "/r", "both of a choice")
+    invalid(models, t("<a/><a/>"), "content", "/r", "no d")
+    invalid(models, t("<a/><a/><e/><d/>"), "content", "/r", "e first")
+    invalid(models, t("<a/><a/>x<d/>"), "content", "/r", "text among elements")
+    invalid(models, t("<a/><a/><b>x</b><d/>"), "value", "/r/b", "a word for an int")
+    invalid(models, t("<a/><a/><b>2147483648</b><d/>"), "value", "/r/b", "past an int")
+    invalid(models, "<r><a/><a/><d/></r>", "content", "/r", "no namespace")
+    invalid(models, "<x xmlns=\"urn:t\"/>", "content", "/x", "an undeclared root")
+    invalid(models, t("<a/><a><z/></a><d/>"), "content", "/r/a", "an element in a string")
+
+    // xs:all, which XSD 1.1 lets repeat.
+    val all = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:all>" +
+        "<xs:element name=\"a\" type=\"xs:string\" maxOccurs=\"unbounded\"/><xs:element name=\"b\" type=\"xs:string\" minOccurs=\"0\" maxOccurs=\"2\"/><xs:element name=\"c\" type=\"xs:string\"/>" +
+        "</xs:all></xs:complexType></xs:element>")
+    valid(all, t("<c/><a/><b/><a/><a/>"), "any order")
+    invalid(all, t("<a/><b/>"), "content", "/r", "without c")
+    invalid(all, t("<c/><a/><b/><b/><b/>"), "content", "/r", "three b")
+    invalid(all, t("<c/><a/><x/>"), "content", "/r", "an unknown element")
+
+    // Attributes, simple content, defaults and fixed values.
+    val attributes = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence>" +
+        "<xs:element name=\"price\" maxOccurs=\"unbounded\"><xs:complexType><xs:simpleContent><xs:extension base=\"xs:decimal\">" +
+        "<xs:attribute name=\"currency\" use=\"required\"><xs:simpleType><xs:restriction base=\"xs:string\"><xs:length value=\"3\"/></xs:restriction></xs:simpleType></xs:attribute>" +
+        "<xs:attribute name=\"version\" type=\"xs:int\" fixed=\"1\"/>" +
+        "</xs:extension></xs:simpleContent></xs:complexType></xs:element>" +
+        "<xs:element name=\"kind\" type=\"xs:token\" default=\"plain\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"fixed\" type=\"xs:decimal\" fixed=\"1.50\" minOccurs=\"0\"/>" +
+        "</xs:sequence><xs:attribute name=\"id\" type=\"xs:NCName\"/></xs:complexType></xs:element>")
+    valid(attributes, t("<price currency=\"EUR\">1.5</price><kind/><fixed>1.5</fixed>"), "attributes, a default and a fixed value")
+    valid(attributes, "<r xmlns=\"urn:t\" id=\"a1\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"urn:t r.xsd\"><price currency=\"EUR\" version=\"01\">1.5</price><fixed/></r>", "an id, a fixed attribute and an empty fixed element")
+    invalid(attributes, t("<price>1.5</price>"), "attribute", "/r/price", "a missing attribute")
+    invalid(attributes, t("<price currency=\"EURO\">1.5</price>"), "attribute", "/r/price", "an attribute too long")
+    invalid(attributes, t("<price currency=\"EUR\" version=\"2\">1.5</price>"), "attribute", "/r/price", "a fixed attribute changed")
+    invalid(attributes, t("<price currency=\"EUR\" rate=\"1\">1.5</price>"), "attribute", "/r/price", "an unknown attribute")
+    invalid(attributes, t("<price currency=\"EUR\">1.5</price><fixed>2</fixed>"), "value", "/r/fixed", "a fixed element changed")
+    invalid(attributes, "<r xmlns=\"urn:t\" id=\"1a\"><price currency=\"EUR\">1</price></r>", "attribute", "/r", "an id that isn't an NCName")
+    invalid(attributes, "<r xmlns=\"urn:t\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:nil=\"true\"/>", "unsupported", "/r", "xsi:nil")
+
+    // Datatypes and facets.
+    val types = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence>" +
+        "<xs:element name=\"money\" minOccurs=\"0\"><xs:simpleType><xs:restriction base=\"xs:decimal\"><xs:totalDigits value=\"5\"/><xs:fractionDigits value=\"2\"/><xs:minExclusive value=\"0\"/><xs:maxExclusive value=\"1000\"/></xs:restriction></xs:simpleType></xs:element>" +
+        "<xs:element name=\"step\" minOccurs=\"0\"><xs:simpleType><xs:restriction base=\"xs:decimal\"><xs:enumeration value=\"1.0\"/><xs:enumeration value=\"2.5\"/></xs:restriction></xs:simpleType></xs:element>" +
+        "<xs:element name=\"year\" type=\"xs:gYear\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"month\" type=\"xs:gYearMonth\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"time\" type=\"xs:time\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"stamp\" type=\"xs:dateTimeStamp\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"late\" minOccurs=\"0\"><xs:simpleType><xs:restriction base=\"xs:dateTime\"><xs:minInclusive value=\"2026-01-01T00:00:00Z\"/></xs:restriction></xs:simpleType></xs:element>" +
+        "<xs:element name=\"hex\" minOccurs=\"0\"><xs:simpleType><xs:restriction base=\"xs:hexBinary\"><xs:length value=\"2\"/></xs:restriction></xs:simpleType></xs:element>" +
+        "<xs:element name=\"b64\" type=\"xs:base64Binary\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"real\" type=\"xs:double\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"span\" type=\"xs:duration\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"lang\" type=\"xs:language\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"words\" minOccurs=\"0\"><xs:simpleType><xs:restriction base=\"xs:token\"><xs:maxLength value=\"7\"/></xs:restriction></xs:simpleType></xs:element>" +
+        "<xs:element name=\"chars\" minOccurs=\"0\"><xs:simpleType><xs:restriction base=\"xs:string\"><xs:maxLength value=\"3\"/><xs:pattern value=\"\\i\\c*\"/></xs:restriction></xs:simpleType></xs:element>" +
+        "<xs:element name=\"flag\" type=\"xs:boolean\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"day\" type=\"xs:gMonthDay\" minOccurs=\"0\"/>" +
+        "</xs:sequence></xs:complexType></xs:element>")
+    valid(types, t("<money>999.99</money><step>2.50</step><year>-0044</year><month>2026-02</month><time>24:00:00</time><stamp>2026-01-01T00:00:00+01:00</stamp>" +
+        "<late>2026-01-01T00:30:00+00:30</late><hex>0aFF</hex><b64>YWJj ZA==</b64><real>-1.5E3</real><span>P1Y2MT3.5S</span><lang>pt-PT</lang><words>  a   b c  </words><chars>xé:</chars><flag>1</flag><day>--02-29</day>"), "every type")
+    valid(types, t("<step>1</step>"), "an enumeration matched by value")
+    invalid(types, t("<money>0</money>"), "value", "/r/money", "the exclusive minimum")
+    invalid(types, t("<money>1000</money>"), "value", "/r/money", "the exclusive maximum")
+    invalid(types, t("<money>1.234</money>"), "value", "/r/money", "fraction digits")
+    invalid(types, t("<money>123456</money>"), "value", "/r/money", "total digits")
+    invalid(types, t("<step>3</step>"), "value", "/r/step", "outside the enumeration")
+    invalid(types, t("<year>26</year>"), "value", "/r/year", "a short year")
+    invalid(types, t("<time>12:00</time>"), "value", "/r/time", "a time without seconds")
+    invalid(types, t("<stamp>2026-01-01T00:00:00</stamp>"), "value", "/r/stamp", "a stamp without a zone")
+    invalid(types, t("<late>2025-12-31T23:59:59Z</late>"), "value", "/r/late", "before the minimum")
+    invalid(types, t("<late>2026-01-01T05:00:00</late>"), "value", "/r/late", "a time without zone too near the minimum")
+    invalid(types, t("<hex>0a0</hex>"), "value", "/r/hex", "odd hex")
+    invalid(types, t("<hex>0a0b0c</hex>"), "value", "/r/hex", "hex too long")
+    invalid(types, t("<b64>YWJ</b64>"), "value", "/r/b64", "short base 64")
+    invalid(types, t("<real>1.5F</real>"), "value", "/r/real", "a float suffix")
+    invalid(types, t("<span>P1S</span>"), "value", "/r/span", "seconds outside time")
+    invalid(types, t("<span>PT</span>"), "value", "/r/span", "an empty time part")
+    invalid(types, t("<lang>portuguese-x</lang>"), "value", "/r/lang", "a subtag too long")
+    invalid(types, t("<words>a b c d e</words>"), "value", "/r/words", "a token too long after collapsing")
+    invalid(types, t("<chars>1ab</chars>"), "value", "/r/chars", "a name starting with a digit")
+    invalid(types, t("<chars>abcd</chars>"), "value", "/r/chars", "four characters")
+    invalid(types, t("<flag>yes</flag>"), "value", "/r/flag", "a boolean word")
+    invalid(types, t("<day>--02-30</day>"), "value", "/r/day", "February 30")
+
+    // Assertions.
+    refused("<xs:element name=\"r\"><xs:complexType><xs:sequence>" +
+        "<xs:element name=\"n\" type=\"xs:decimal\" maxOccurs=\"unbounded\"/><xs:element name=\"s\" type=\"xs:string\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"in\" minOccurs=\"0\"><xs:complexType><xs:sequence><xs:element name=\"v\" type=\"xs:string\"/></xs:sequence>" +
+        "<xs:assert test=\"empty(../t:s) and exists(t:v) and . = .\"/></xs:complexType></xs:element>" +
+        "</xs:sequence>" +
+        "<xs:assert test=\"count(t:n) le 3\"/>" +
+        "<xs:assert test=\"fn:not(t:s = 'no') and boolean(t:n)\"/>" +
+        "<xs:assert test=\"if (t:s) then t:n[1] = 1 else true()\"/>" +
+        "</xs:complexType></xs:element>", "predicates aren't supported")
+    val asserted = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence>" +
+        "<xs:element name=\"n\" type=\"xs:decimal\" maxOccurs=\"unbounded\"/><xs:element name=\"s\" type=\"xs:string\" minOccurs=\"0\"/>" +
+        "<xs:element name=\"in\" minOccurs=\"0\"><xs:complexType><xs:sequence><xs:element name=\"v\" type=\"xs:string\"/></xs:sequence>" +
+        "<xs:assert test=\"empty(../t:s) and exists(t:v) and t:v = 'x'\"/></xs:complexType></xs:element>" +
+        "</xs:sequence>" +
+        "<xs:assert test=\"count(t:n) le 3\"/>" +
+        "<xs:assert test=\"fn:not(t:s = 'no') and boolean(t:n)\"/>" +
+        "<xs:assert test=\"if (t:s eq 'one') then t:n = 1.0 else true()\"/>" +
+        "<xs:assert test=\"not(t:s) or t:s ne 'number' or t:n eq 5\"/>" +
+        "</xs:complexType></xs:element>")
+    valid(asserted, t("<n>1</n><n>2</n><s>one</s><in><v>x</v></in>"), "assertions that hold, `..` empty in the inner one")
+    invalid(asserted, t("<n>1</n><n>2</n><n>3</n><n>4</n>"), "assertion", "/r", "count")
+    invalid(asserted, t("<n>1</n><s>no</s>"), "assertion", "/r", "not()")
+    invalid(asserted, t("<n>2</n><n>3</n><s>one</s>"), "assertion", "/r", "a general comparison with no match")
+    invalid(asserted, t("<n>5</n><n>5</n><s>number</s>"), "assertion", "/r", "eq on two values is an error, so false")
+    invalid(asserted, t("<n>1</n><in><v>y</v></in>"), "assertion", "/r/in", "the inner assertion")
+
+    // Identity constraints: keys on attributes, a descendant selector, keyref and unique.
+    val keys = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence>" +
+        "<xs:element name=\"item\" maxOccurs=\"unbounded\"><xs:complexType><xs:sequence><xs:element name=\"ref\" type=\"xs:decimal\" minOccurs=\"0\"/></xs:sequence>" +
+        "<xs:attribute name=\"id\" type=\"xs:decimal\"/><xs:attribute name=\"code\" type=\"xs:string\"/></xs:complexType></xs:element>" +
+        "</xs:sequence></xs:complexType>" +
+        "<xs:key name=\"ids\"><xs:selector xpath=\".//t:item\"/><xs:field xpath=\"@id\"/></xs:key>" +
+        "<xs:keyref name=\"refs\" refer=\"t:ids\"><xs:selector xpath=\"t:item\"/><xs:field xpath=\"t:ref\"/></xs:keyref>" +
+        "<xs:unique name=\"codes\"><xs:selector xpath=\"t:item\"/><xs:field xpath=\"@code\"/></xs:unique>" +
+        "</xs:element>")
+    valid(keys, t("<item id=\"1\"><ref>2.0</ref></item><item id=\"2\" code=\"a\"/><item id=\"3\" code=\"b\"><ref>1</ref></item>"), "keys, a reference before its key, decimals by value")
+    invalid(keys, t("<item id=\"1\"/><item id=\"1.0\"/>"), "identity", "/r/item", "a duplicate key")
+    invalid(keys, t("<item id=\"1\"/><item/>"), "identity", "/r/item", "a missing key")
+    invalid(keys, t("<item id=\"1\"><ref>9</ref></item>"), "identity", "/r", "a reference to nothing")
+    invalid(keys, t("<item id=\"1\" code=\"a\"/><item id=\"2\" code=\"a\"/>"), "identity", "/r/item", "a duplicate unique value")
+
+    // Unsupported constructs are refused when the schema is loaded, never skipped.
+    refused("<xs:import namespace=\"urn:x\"/>", "xs:import")
+    refused("<xs:include schemaLocation=\"x.xsd\"/>", "xs:include")
+    refused("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:any/></xs:sequence></xs:complexType></xs:element>", "xs:any")
+    refused("<xs:element name=\"r\"/>", "xs:anyType")
+    refused("<xs:element name=\"r\" type=\"xs:anyType\"/>", "xs:anyType")
+    refused("<xs:element name=\"r\" type=\"xs:QName\"/>", "xs:QName")
+    refused("<xs:element name=\"r\" type=\"xs:IDREF\"/>", "xs:IDREF")
+    refused("<xs:simpleType name=\"l\"><xs:list itemType=\"xs:int\"/></xs:simpleType>", "xs:list")
+    refused("<xs:simpleType name=\"u\"><xs:union memberTypes=\"xs:int\"/></xs:simpleType>", "xs:union")
+    refused("<xs:complexType name=\"c\"><xs:complexContent><xs:extension base=\"t:c\"/></xs:complexContent></xs:complexType>", "xs:complexContent")
+    refused("<xs:element name=\"r\" type=\"xs:string\" nillable=\"true\"/>", "nillable")
+    refused("<xs:element name=\"r\" type=\"xs:string\" substitutionGroup=\"t:s\"/>", "substitution groups")
+    refused("<xs:element name=\"r\" type=\"xs:string\"><xs:alternative test=\"@a\" type=\"xs:int\"/></xs:element>", "xs:alternative")
+    refused("<xs:complexType name=\"c\"><xs:openContent mode=\"interleave\"/></xs:complexType>", "xs:openContent")
+    refused("<xs:complexType name=\"c\"><xs:anyAttribute/></xs:complexType>", "xs:anyAttribute")
+    refused("<xs:group name=\"g\"><xs:sequence/></xs:group>", "xs:group")
+    refused("<xs:simpleType name=\"d\"><xs:restriction base=\"xs:string\"><xs:pattern value=\"\\d+\"/></xs:restriction></xs:simpleType>", "Unicode")
+    refused("<xs:simpleType name=\"d\"><xs:restriction base=\"xs:double\"><xs:minInclusive value=\"0\"/></xs:restriction></xs:simpleType>", "xs:minInclusive on this type")
+    refused("<xs:complexType name=\"c\"><xs:sequence/><xs:assert test=\"1 + 1 = 2\"/></xs:complexType>", "'+' isn't supported")
+    refused("<xs:complexType name=\"c\"><xs:sequence/><xs:assert test=\"string-length(.) gt 1\"/></xs:complexType>", "string-length() isn't supported")
+    refused("<xs:complexType name=\"c\"><xs:sequence/><xs:assert test=\"@a\"/></xs:complexType>", "attributes aren't supported")
+    refused("<xs:complexType name=\"c\"><xs:sequence/><xs:assert test=\".//t:a\"/></xs:complexType>", "// isn't supported")
+    refused("<xs:complexType name=\"c\"><xs:sequence/><xs:assert test=\"some \$x in t:a satisfies \$x\"/></xs:complexType>", "expressions aren't supported")
+    refused("<xs:complexType name=\"c\"><xs:sequence/><xs:assert test=\"1e3 gt 1\"/></xs:complexType>", "a double literal")
+    refused("<xs:complexType name=\"c\"><xs:sequence/><xs:assert test=\"q:a\"/></xs:complexType>", "isn't declared")
+    refused("<xs:complexType name=\"c\"><xs:sequence/><xs:assert test=\"t:a\" xpathDefaultNamespace=\"##targetNamespace\"/></xs:complexType>", "xpathDefaultNamespace")
+    refused("<xs:element name=\"r\" type=\"xs:string\" xmlns:vc=\"http://www.w3.org/2007/XMLSchema-versioning\" vc:typeAvailable=\"xs:int\"/>", "vc:typeAvailable")
+    refused("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"a\" type=\"t:missing\"/></xs:sequence></xs:complexType></xs:element>", "no simple type missing")
+    refused("<xs:simpleType name=\"a\"><xs:restriction base=\"t:b\"/></xs:simpleType><xs:simpleType name=\"b\"><xs:restriction base=\"t:a\"/></xs:simpleType>", "derives from itself")
+    refused("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"a\" type=\"xs:string\" maxOccurs=\"unbounded\"><xs:complexType><xs:sequence/></xs:complexType>" +
+        "<xs:key name=\"k\"><xs:selector xpath=\"t:b\"/><xs:field xpath=\"t:c\"/></xs:key></xs:element></xs:sequence></xs:complexType>" +
+        "<xs:keyref name=\"f\" refer=\"t:k\"><xs:selector xpath=\"t:a\"/><xs:field xpath=\"t:c\"/></xs:keyref></xs:element>", "an element with a type attribute can't have its own type")
+    refused("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"a\" maxOccurs=\"unbounded\"><xs:complexType><xs:sequence><xs:element name=\"c\" type=\"xs:string\"/></xs:sequence></xs:complexType>" +
+        "<xs:key name=\"k\"><xs:selector xpath=\".\"/><xs:field xpath=\"t:c\"/></xs:key></xs:element></xs:sequence></xs:complexType>" +
+        "<xs:keyref name=\"f\" refer=\"t:k\"><xs:selector xpath=\"t:a\"/><xs:field xpath=\"t:c\"/></xs:keyref></xs:element>", "a keyref referring to a key on another element")
+    refused("<xs:element name=\"r\"><xs:simpleType><xs:restriction base=\"xs:string\"><xs:pattern value=\"(a{1,1000}){1,1000}\"/></xs:restriction></xs:simpleType></xs:element>", "more than")
+    refused("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"a\" type=\"xs:string\" maxOccurs=\"2000000\"/></xs:sequence></xs:complexType></xs:element>", "states")
+    expect(!xsdLoad("<xs:schema xmlns:xs=\"urn:not-xsd\"/>").succeeded, "a root that isn't xs:schema")
+    expect(!xsdLoad("<!DOCTYPE xs:schema [<!ENTITY e 'x'>]><xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"/>").succeeded, "a schema with a DTD, by default")
+    // vc:minVersion leaves out what a later XSD needs.
+    val versioned = schemaOf("<xs:element name=\"r\" xmlns:vc=\"http://www.w3.org/2007/XMLSchema-versioning\" vc:minVersion=\"1.2\" type=\"xs:QName\"/><xs:element name=\"r\" type=\"xs:string\" xmlns:vc=\"http://www.w3.org/2007/XMLSchema-versioning\" vc:maxVersion=\"1.2\"/>")
+    valid(versioned, "<r xmlns=\"urn:t\">x</r>", "the 1.1 declaration")
+
+    // Hostile documents: the reader's limits hold, and the validator's own.
+    val simple = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"r\" type=\"xs:string\" minOccurs=\"0\"/><xs:element name=\"k\" minOccurs=\"0\" maxOccurs=\"unbounded\"><xs:complexType><xs:sequence><xs:element name=\"v\" type=\"xs:string\" maxOccurs=\"unbounded\"/></xs:sequence><xs:assert test=\"t:v\"/><xs:attribute name=\"id\" type=\"xs:string\"/></xs:complexType></xs:element></xs:sequence></xs:complexType>" +
+        "<xs:unique name=\"u\"><xs:selector xpath=\"t:k\"/><xs:field xpath=\"@id\"/></xs:unique></xs:element>")
+    if (simple != null) {
+        val dtd = xsdValidate(simple, "<!DOCTYPE r [<!ENTITY e 'x'>]><r xmlns=\"urn:t\"><r>&e;</r></r>")
+        expect(!dtd.valid && dtd.xmlError?.code == "dtd_forbidden", "a DTD is refused by default")
+        val laughs = byteBuffer()
+        laughs.appendText("<!DOCTYPE r [<!ENTITY l0 'hahahahaha'>")
+        var i = 1
+        while (i <= 9) {
+            laughs.appendText("<!ENTITY l$i '${"&l${i - 1};".repeat(10)}'>")
+            i = i + 1
+        }
+        laughs.appendText("]><r xmlns=\"urn:t\"><r>&l9;</r></r>")
+        val laughed = xsdValidate(simple, laughs.toText(), XsdOptions(XmlOptions(allowDtd = true)))
+        expect(!laughed.valid && laughed.xmlError != null, "a billion laughs stop at the entity limits: ${laughed.xmlError?.code ?? ""}")
+        val deep = "<r xmlns=\"urn:t\">${"<r>".repeat(300)}${"</r>".repeat(300)}</r>"
+        val tooDeep = xsdValidate(simple, deep)
+        expect(!tooDeep.valid && tooDeep.xmlError?.code == "too_deep", "nesting past maxDepth: ${tooDeep.xmlError?.code ?? ""}")
+        val big = "<r xmlns=\"urn:t\"><r>${"x".repeat(5000)}</r></r>"
+        val tooBig = xsdValidate(simple, big, XsdOptions(XmlOptions(maxBytes = 1000)))
+        expect(!tooBig.valid && tooBig.xmlError?.code == "too_large", "a document past maxBytes: ${tooBig.xmlError?.code ?? ""}")
+        val many = byteBuffer()
+        many.appendText("<r xmlns=\"urn:t\">")
+        i = 0
+        while (i < 50) {
+            many.appendText("<k id=\"same\"><v/></k>")
+            i = i + 1
+        }
+        many.appendText("</r>")
+        val counted = xsdValidate(simple, many.toText(), XsdOptions(maxErrors = 5))
+        expectEqual(counted.errors.size, 5, "maxErrors keeps five")
+        expectEqual(counted.errorCount, 49, "and counts all 49 duplicates")
+        val distinct = byteBuffer()
+        distinct.appendText("<r xmlns=\"urn:t\">")
+        i = 0
+        while (i < 50) {
+            distinct.appendText("<k id=\"k$i\"><v/></k>")
+            i = i + 1
+        }
+        distinct.appendText("</r>")
+        valid(simple, distinct.toText(), "fifty distinct keys")
+        val entries = xsdValidate(simple, distinct.toText(), XsdOptions(maxIdentityEntries = 10))
+        expect(!entries.valid && entries.errors[entries.errors.size - 1].code == "limit", "maxIdentityEntries stops the validation")
+        val wide = "<r xmlns=\"urn:t\"><k>${"<v/>".repeat(100)}</k></r>"
+        val tooWide = xsdValidate(simple, wide, XsdOptions(maxAssertionNodes = 50))
+        expect(!tooWide.valid && tooWide.errors[tooWide.errors.size - 1].code == "limit", "maxAssertionNodes stops the validation")
+        valid(simple, wide, "the same within the default limits")
+        // A long value against a pattern takes linear time.
+        val pattern = schemaOf("<xs:element name=\"r\"><xs:simpleType><xs:restriction base=\"xs:string\"><xs:pattern value=\"(a|aa)*(a|aa)*c\"/></xs:restriction></xs:simpleType></xs:element>")
+        invalid(pattern, "<r xmlns=\"urn:t\">${"a".repeat(200000)}b</r>", "value", "/r", "a long value that doesn't match")
+    }
+    testsPassed()
+}

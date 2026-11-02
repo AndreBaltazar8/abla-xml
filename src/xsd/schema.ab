@@ -1,0 +1,1102 @@
+// Loading an XML Schema (1.1, and so 1.0) document into components the validator runs.
+// One document, read from bytes given: xs:include, xs:import and the rest that would read
+// another are refused, as is every construct the validator doesn't implement. A schema
+// that loads is validated in full; one that uses something unsupported doesn't load.
+import "abla/text"
+import "../chars.ab"
+import "../reader.ab"
+import "../tree.ab"
+import "../parse.ab"
+import "regex.ab"
+import "values.ab"
+import "xpath.ab"
+
+val xsdNamespace = "http://www.w3.org/2001/XMLSchema"
+val xsdInstanceNamespace = "http://www.w3.org/2001/XMLSchema-instance"
+val xsdVersioningNamespace = "http://www.w3.org/2007/XMLSchema-versioning"
+
+val xsdContentEmpty = 0
+val xsdContentSimple = 1
+val xsdContentElements = 2
+val xsdContentMixed = 3
+
+val xsdIdentityUnique = 0
+val xsdIdentityKey = 1
+val xsdIdentityKeyref = 2
+
+class XsdSimpleType(
+    val name: string,
+    val namespace: string,
+    val primitive: int,
+    val integerOnly: bool,
+    var whitespace: int,
+    // Each derivation step's patterns: a value matches one of each step's.
+    val patterns: array<array<int>>,
+    // Each step's enumeration, as lexical values: a value equals one of each.
+    val enumerations: array<array<string>>,
+    var length: int = -1,
+    var minLength: int = -1,
+    var maxLength: int = -1,
+    // Bounds as lexical values, "" for none.
+    var minInclusive: string = "",
+    var maxInclusive: string = "",
+    var minExclusive: string = "",
+    var maxExclusive: string = "",
+    var totalDigits: int = -1,
+    var fractionDigits: int = -1,
+    var zoneRequired: bool = false
+)
+
+class XsdAttributeUse(
+    val name: string,
+    val namespace: string,
+    val simpleType: int,
+    val required: bool,
+    val fixed: string,
+    val hasFixed: bool
+)
+
+class XsdAssertion(val test: string, val expression: XsdExpr, val line: int)
+
+class XsdComplexType(
+    val name: string,
+    val namespace: string,
+    var content: int,
+    // For simple content.
+    var simpleType: int,
+    // For element and mixed content: an XsdModel.
+    var model: int,
+    val attributes: array<XsdAttributeUse>,
+    val assertions: array<XsdAssertion>,
+    val line: int
+)
+
+class XsdElementDecl(
+    val name: string,
+    val namespace: string,
+    // xsdTypeSimple or xsdTypeComplex, and the index in that list.
+    var typeKind: int,
+    var typeIndex: int,
+    val identities: array<int>,
+    val valueDefault: string,
+    val hasDefault: bool,
+    val valueFixed: string,
+    val hasFixed: bool,
+    val line: int
+)
+
+val xsdTypeSimple = 1
+val xsdTypeComplex = 2
+
+class XsdIdentity(
+    val kind: int,
+    val name: string,
+    val namespace: string,
+    // For a keyref, the key or unique it refers to.
+    var refer: int,
+    val selector: array<XsdIdentityPath>,
+    val fields: array<array<XsdIdentityPath>>,
+    val element: int,
+    val line: int
+)
+
+// A content model. A sequence or choice is an automaton: states with moves that take an
+// element (`edgeDecl`, to `edgeTo`), and `closure`, what a state reaches without one. An
+// xs:all keeps its elements' bounds instead.
+class XsdModel(
+    val all: bool,
+    val edgeDecl: array<array<int>>,
+    val edgeTo: array<array<int>>,
+    val closure: array<array<int>>,
+    val start: int,
+    val accept: int,
+    val allDecls: array<int>,
+    val allMin: array<int>,
+    val allMax: array<int>,
+    val allOptional: bool
+)
+
+class XsdSchema(
+    val targetNamespace: string,
+    val simpleTypes: array<XsdSimpleType>,
+    val complexTypes: array<XsdComplexType>,
+    val elements: array<XsdElementDecl>,
+    val models: array<XsdModel>,
+    val identities: array<XsdIdentity>,
+    val regexes: array<XsdRegex>,
+    // Global elements by "namespace localName".
+    val globalElements: Map<string, int>,
+    // The local names identity selectors end in ("*" for any), so most elements skip them.
+    val selectorNames: Map<string, bool>
+)
+
+// The most automaton states a schema's content models may expand to.
+val xsdMaxModelStates = 1048576
+
+class XsdSchemaResult(val succeeded: bool, val schema: XsdSchema?, val error: string)
+
+// --- Particles, before they become automata --------------------------------------------
+
+sealed interface XsdParticle
+class XsdParticleElement(val decl: int, val min: int, val max: int) : XsdParticle
+// `kind` 0 sequence, 1 choice, 2 all.
+class XsdParticleGroup(val kind: int, val items: array<XsdParticle>, val min: int, val max: int) : XsdParticle
+
+class XsdQName(val ok: bool, val namespace: string, val localName: string)
+
+class XsdScope(val prefixes: array<string>, val uris: array<string>)
+
+private fun xsdKey(namespace: string, localName: string): string = "$namespace $localName"
+
+// The schema document: its root, and its top-level components by "kind namespace localName" as
+// indexes into topNodes. Kept apart from the loader, which changes as it reads them.
+class XsdSchemaDocument(val root: XmlElement, val topLevel: Map<string, int>, val topNodes: array<XmlElement>)
+
+class XsdLoader(
+    val schema: XsdSchema,
+    val builtins: Map<string, int>,
+    val simpleByName: Map<string, int>,
+    val complexByName: Map<string, int>,
+    val identityByName: Map<string, int>,
+    // Simple types being derived, against cycles.
+    val deriving: Map<string, bool>,
+    // Keyrefs and the names they refer to, resolved at the end: one may name a later constraint.
+    val referNames: array<string>,
+    val referOwners: array<int>,
+    val referLines: array<int>,
+    var elementQualified: bool = false,
+    var attributeQualified: bool = false,
+    var error: string = "",
+    var states: int = 0
+) {
+    fun fail(node: XmlElement, message: string): void {
+        if (error == "") error = "line ${node.line}: $message"
+        return
+    }
+
+    fun unsupported(node: XmlElement, what: string): void {
+        fail(node, "unsupported: $what")
+        return
+    }
+
+    fun scopeOf(parent: XsdScope, node: XmlElement): XsdScope {
+        val prefixes: array<string> = []
+        val uris: array<string> = []
+        for (p in parent.prefixes) prefixes.append(p)
+        for (u in parent.uris) uris.append(u)
+        for (a in node.attributes) {
+            if (a.namespaceUri == xmlNamespaceXmlns) {
+                prefixes.append(if (a.prefix == "") "" else a.localName)
+                uris.append(a.value)
+            }
+        }
+        XsdScope(prefixes, uris)
+    }
+
+    fun resolve(scope: XsdScope, qname: string, node: XmlElement): XsdQName {
+        val trimmed = xsdNormalizeWhitespace(qname, xsdWhitespaceCollapse)
+        if (!xmlIsQName(trimmed)) {
+            fail(node, "'$qname' isn't a QName")
+            return XsdQName(false, "", "")
+        }
+        val prefix = xmlPrefixOf(trimmed)
+        if (prefix == "xml") return XsdQName(true, xmlNamespaceXml, xmlLocalOf(trimmed))
+        var i = scope.prefixes.size - 1
+        while (i >= 0) {
+            if (scope.prefixes[i] == prefix) return XsdQName(true, scope.uris[i], xmlLocalOf(trimmed))
+            i = i - 1
+        }
+        if (prefix == "") return XsdQName(true, "", trimmed)
+        fail(node, "the prefix of '$qname' isn't declared")
+        XsdQName(false, "", "")
+    }
+
+    fun prefixesOf(scope: XsdScope): XsdPrefixes {
+        // XPath's default element namespace is none: the unprefixed binding doesn't apply.
+        val prefixes: array<string> = []
+        val uris: array<string> = []
+        var i = 0
+        while (i < scope.prefixes.size) {
+            if (scope.prefixes[i] != "") {
+                prefixes.append(scope.prefixes[i])
+                uris.append(scope.uris[i])
+            }
+            i = i + 1
+        }
+        XsdPrefixes(prefixes, uris)
+    }
+
+    // Whether vc:minVersion and vc:maxVersion leave this element in, for an XSD 1.1
+    // processor; another vc: attribute is unsupported.
+    fun included(node: XmlElement): bool {
+        for (a in node.attributes) {
+            if (a.namespaceUri != xsdVersioningNamespace) continue
+            val value = a.value.trim()
+            if (a.localName == "minVersion") {
+                val d = xsdDecimalParse(value)
+                if (!d.ok) { fail(node, "vc:minVersion '$value'"); return false }
+                if (xsdDecimalCompare(d, xsdDecimalParse("1.1")) > 0) return false
+            } else if (a.localName == "maxVersion") {
+                val d = xsdDecimalParse(value)
+                if (!d.ok) { fail(node, "vc:maxVersion '$value'"); return false }
+                if (xsdDecimalCompare(d, xsdDecimalParse("1.1")) <= 0) return false
+            } else {
+                unsupported(node, "vc:${a.localName}")
+                return false
+            }
+        }
+        true
+    }
+
+    // Checks the element's unprefixed attributes are among `allowed`, and that no
+    // attribute in the XSD namespace is there.
+    fun attributesAllowed(node: XmlElement, allowed: array<string>): void {
+        for (a in node.attributes) {
+            if (a.namespaceUri == xmlNamespaceXmlns || a.namespaceUri == xsdVersioningNamespace) continue
+            if (a.namespaceUri == xsdNamespace) {
+                fail(node, "attribute ${a.name} in the XSD namespace")
+                continue
+            }
+            if (a.namespaceUri != "") continue
+            var known = false
+            for (name in allowed) if (name == a.localName) known = true
+            if (!known) unsupported(node, "the attribute ${a.localName} on xs:${node.localName}")
+        }
+        return
+    }
+
+    // The XSD children of a schema element, without annotations and what vc: leaves out.
+    fun children(node: XmlElement): array<XmlElement> {
+        val found: array<XmlElement> = []
+        for (child in node.elements()) {
+            if (child.namespaceUri != xsdNamespace) {
+                fail(child, "${child.name} isn't an XSD element")
+                continue
+            }
+            if (child.localName == "annotation") continue
+            if (!included(child)) continue
+            found.append(child)
+        }
+        found
+    }
+
+    fun occurs(node: XmlElement, name: string, fallback: int): int {
+        val attribute = node.attribute(name)
+        if (attribute == null) return fallback
+        val text = attribute.value.trim()
+        if (name == "maxOccurs" && text == "unbounded") return -1
+        val d = xsdDecimalParse(text, true)
+        if (!d.ok || d.negative || d.whole.size > 9) {
+            fail(node, "$name '${attribute.value}'")
+            return fallback
+        }
+        xsdDigitsValue(xsdDecimalCanonical(d))
+    }
+
+    // --- Simple types ---
+
+    fun addSimple(t: XsdSimpleType): int {
+        schema.simpleTypes.append(t)
+        schema.simpleTypes.size - 1
+    }
+
+    // A new type deriving from `base`, with its facets so far.
+    fun derived(base: int, name: string, namespace: string): XsdSimpleType {
+        val b = schema.simpleTypes[base]
+        val patterns: array<array<int>> = []
+        for (p in b.patterns) patterns.append(p)
+        val enumerations: array<array<string>> = []
+        for (e in b.enumerations) enumerations.append(e)
+        XsdSimpleType(name, namespace, b.primitive, b.integerOnly, b.whitespace, patterns, enumerations,
+            b.length, b.minLength, b.maxLength, b.minInclusive, b.maxInclusive, b.minExclusive, b.maxExclusive,
+            b.totalDigits, b.fractionDigits, b.zoneRequired)
+    }
+
+    fun builtin(name: string, primitive: int, whitespace: int, integerOnly: bool = false): int {
+        val index = addSimple(XsdSimpleType(name, xsdNamespace, primitive, integerOnly, whitespace, [], []))
+        builtins.set(name, index)
+        index
+    }
+
+    fun builtinRestriction(name: string, base: string, minInclusive: string, maxInclusive: string, pattern: string = ""): int {
+        val t = derived(builtins.get(base) ?? 0, name, xsdNamespace)
+        if (minInclusive != "") t.minInclusive = minInclusive
+        if (maxInclusive != "") t.maxInclusive = maxInclusive
+        if (pattern != "") {
+            schema.regexes.append(xsdRegexCompile(pattern))
+            t.patterns.append([schema.regexes.size - 1])
+        }
+        val index = addSimple(t)
+        builtins.set(name, index)
+        index
+    }
+
+    fun addBuiltins(): void {
+        builtin("anySimpleType", xsdPrimitiveAny, xsdWhitespacePreserve)
+        builtin("anyAtomicType", xsdPrimitiveAny, xsdWhitespacePreserve)
+        builtin("string", xsdPrimitiveString, xsdWhitespacePreserve)
+        builtin("boolean", xsdPrimitiveBoolean, xsdWhitespaceCollapse)
+        builtin("decimal", xsdPrimitiveDecimal, xsdWhitespaceCollapse)
+        builtin("integer", xsdPrimitiveDecimal, xsdWhitespaceCollapse, true)
+        builtin("date", xsdPrimitiveDate, xsdWhitespaceCollapse)
+        builtin("dateTime", xsdPrimitiveDateTime, xsdWhitespaceCollapse)
+        builtin("time", xsdPrimitiveTime, xsdWhitespaceCollapse)
+        builtin("gYear", xsdPrimitiveGYear, xsdWhitespaceCollapse)
+        builtin("gYearMonth", xsdPrimitiveGYearMonth, xsdWhitespaceCollapse)
+        builtin("gMonthDay", xsdPrimitiveGMonthDay, xsdWhitespaceCollapse)
+        builtin("gDay", xsdPrimitiveGDay, xsdWhitespaceCollapse)
+        builtin("gMonth", xsdPrimitiveGMonth, xsdWhitespaceCollapse)
+        builtin("anyURI", xsdPrimitiveAnyUri, xsdWhitespaceCollapse)
+        builtin("base64Binary", xsdPrimitiveBase64, xsdWhitespaceCollapse)
+        builtin("hexBinary", xsdPrimitiveHex, xsdWhitespaceCollapse)
+        builtin("double", xsdPrimitiveDouble, xsdWhitespaceCollapse)
+        builtin("float", xsdPrimitiveFloat, xsdWhitespaceCollapse)
+        builtin("duration", xsdPrimitiveDuration, xsdWhitespaceCollapse)
+        val stamp = derived(builtins.get("dateTime") ?? 0, "dateTimeStamp", xsdNamespace)
+        stamp.zoneRequired = true
+        builtins.set("dateTimeStamp", addSimple(stamp))
+        val normalized = derived(builtins.get("string") ?? 0, "normalizedString", xsdNamespace)
+        normalized.whitespace = xsdWhitespaceReplace
+        builtins.set("normalizedString", addSimple(normalized))
+        val token = derived(builtins.get("string") ?? 0, "token", xsdNamespace)
+        token.whitespace = xsdWhitespaceCollapse
+        builtins.set("token", addSimple(token))
+        builtinRestriction("language", "token", "", "", "[a-zA-Z]{1,8}(-[a-zA-Z0-9]{1,8})*")
+        builtinRestriction("NMTOKEN", "token", "", "", "\\c+")
+        builtinRestriction("Name", "token", "", "", "\\i\\c*")
+        builtinRestriction("NCName", "Name", "", "", "[\\i-[:]][\\c-[:]]*")
+        builtinRestriction("nonPositiveInteger", "integer", "", "0")
+        builtinRestriction("negativeInteger", "nonPositiveInteger", "", "-1")
+        builtinRestriction("long", "integer", "-9223372036854775808", "9223372036854775807")
+        builtinRestriction("int", "long", "-2147483648", "2147483647")
+        builtinRestriction("short", "int", "-32768", "32767")
+        builtinRestriction("byte", "short", "-128", "127")
+        builtinRestriction("nonNegativeInteger", "integer", "0", "")
+        builtinRestriction("unsignedLong", "nonNegativeInteger", "", "18446744073709551615")
+        builtinRestriction("unsignedInt", "unsignedLong", "", "4294967295")
+        builtinRestriction("unsignedShort", "unsignedInt", "", "65535")
+        builtinRestriction("unsignedByte", "unsignedShort", "", "255")
+        builtinRestriction("positiveInteger", "nonNegativeInteger", "1", "")
+        return
+    }
+
+    // The simple type a QName names, or -1 after failing.
+    fun simpleTypeNamed(doc: XsdSchemaDocument, namespace: string, localName: string, node: XmlElement): int {
+        if (namespace == xsdNamespace) {
+            val found = builtins.get(localName)
+            if (found != null) return found
+            unsupported(node, "the type xs:$localName")
+            return -1
+        }
+        val key = xsdKey(namespace, localName)
+        val done = simpleByName.get(key)
+        if (done != null) return done
+        val at = doc.topLevel.get("simpleType $key")
+        if (at == null) {
+            if (doc.topLevel.has("complexType $key")) fail(node, "$localName is a complex type where a simple one is needed")
+            else fail(node, "no simple type $localName")
+            return -1
+        }
+        if (deriving.has(key)) {
+            fail(node, "the simple type $localName derives from itself")
+            return -1
+        }
+        deriving.set(key, true)
+        val index = simpleType(doc, doc.topNodes[at], XsdScope([], []), localName, namespace)
+        deriving.remove(key)
+        simpleByName.set(key, index)
+        index
+    }
+
+    // An xs:simpleType element: a restriction of a base, with facets.
+    fun simpleType(doc: XsdSchemaDocument, node: XmlElement, outer: XsdScope, name: string, namespace: string): int {
+        val scope = if (name != "") scopeOf(scopeOf(XsdScope([], []), doc.root), node) else scopeOf(outer, node)
+        attributesAllowed(node, ["name", "id", "final"])
+        val parts = children(node)
+        if (parts.size != 1) {
+            fail(node, "xs:simpleType needs one xs:restriction")
+            return -1
+        }
+        val restriction = parts[0]
+        if (restriction.localName == "list" || restriction.localName == "union") {
+            unsupported(restriction, "xs:${restriction.localName}")
+            return -1
+        }
+        if (restriction.localName != "restriction") {
+            fail(restriction, "xs:${restriction.localName} in xs:simpleType")
+            return -1
+        }
+        restrictionOf(doc, restriction, scopeOf(scope, restriction), name, namespace)
+    }
+
+    fun restrictionOf(doc: XsdSchemaDocument, restriction: XmlElement, scope: XsdScope, name: string, namespace: string): int {
+        attributesAllowed(restriction, ["base", "id"])
+        var base = -1
+        val facets = children(restriction)
+        var first = 0
+        val baseName = restriction.attribute("base")
+        if (baseName != null) {
+            val q = resolve(scope, baseName.value, restriction)
+            if (!q.ok) return -1
+            base = simpleTypeNamed(doc, q.namespace, q.localName, restriction)
+        } else if (facets.size > 0 && facets[0].localName == "simpleType") {
+            base = simpleType(doc, facets[0], scope, "", "")
+            first = 1
+        } else {
+            fail(restriction, "xs:restriction needs a base")
+        }
+        if (base < 0) return -1
+        val t = derived(base, name, namespace)
+        val patterns: array<int> = []
+        val enumeration: array<string> = []
+        var i = first
+        while (i < facets.size) {
+            facet(facets[i], t, patterns, enumeration)
+            i = i + 1
+        }
+        if (patterns.size > 0) t.patterns.append(patterns)
+        if (enumeration.size > 0) t.enumerations.append(enumeration)
+        addSimple(t)
+    }
+
+    fun facetInt(node: XmlElement, value: string): int {
+        val d = xsdDecimalParse(value.trim(), true)
+        if (!d.ok || d.negative || d.whole.size > 18) {
+            fail(node, "xs:${node.localName} '$value' isn't a non-negative integer")
+            return -1
+        }
+        xsdDigitsValue(xsdDecimalCanonical(d))
+    }
+
+    // A bound, checked against the type, and normalized as its values are.
+    fun facetBound(node: XmlElement, t: XsdSimpleType, value: string): string {
+        if (!xsdPrimitiveOrdered(t.primitive)) {
+            unsupported(node, "xs:${node.localName} on this type")
+            return ""
+        }
+        val normalized = xsdNormalizeWhitespace(value, xsdWhitespaceCollapse)
+        if (!xsdLexicalOk(t.primitive, normalized, t.integerOnly)) {
+            fail(node, "'$value' isn't a value of the type")
+            return ""
+        }
+        normalized
+    }
+
+    fun facet(node: XmlElement, var t: XsdSimpleType, var patterns: array<int>, var enumeration: array<string>): void {
+        attributesAllowed(node, ["value", "id", "fixed"])
+        val attribute = node.attribute("value")
+        if (attribute == null) {
+            if (node.localName == "assertion" || node.localName == "explicitTimezone") unsupported(node, "the facet xs:${node.localName}")
+            else fail(node, "xs:${node.localName} needs a value")
+            return
+        }
+        val value = attribute.value
+        val ordered = xsdPrimitiveOrdered(t.primitive)
+        when (node.localName) {
+            "pattern" -> {
+                val regex = xsdRegexCompile(value)
+                if (regex.error != "") {
+                    fail(node, "pattern '$value': ${regex.error}")
+                    return
+                }
+                schema.regexes.append(regex)
+                patterns.append(schema.regexes.size - 1)
+            }
+            "enumeration" -> {
+                val normalized = xsdNormalizeWhitespace(value, t.whitespace)
+                if (!xsdLexicalOk(t.primitive, normalized, t.integerOnly)) {
+                    fail(node, "the enumeration '$value' isn't a value of the type")
+                    return
+                }
+                enumeration.append(normalized)
+            }
+            "length" -> t.length = facetInt(node, value)
+            "minLength" -> t.minLength = facetInt(node, value)
+            "maxLength" -> t.maxLength = facetInt(node, value)
+            "minInclusive" -> t.minInclusive = facetBound(node, t, value)
+            "maxInclusive" -> t.maxInclusive = facetBound(node, t, value)
+            "minExclusive" -> t.minExclusive = facetBound(node, t, value)
+            "maxExclusive" -> t.maxExclusive = facetBound(node, t, value)
+            "totalDigits" -> {
+                if (t.primitive != xsdPrimitiveDecimal) unsupported(node, "xs:totalDigits on this type")
+                t.totalDigits = facetInt(node, value)
+            }
+            "fractionDigits" -> {
+                if (t.primitive != xsdPrimitiveDecimal) unsupported(node, "xs:fractionDigits on this type")
+                t.fractionDigits = facetInt(node, value)
+            }
+            "whiteSpace" -> {
+                val mode = value.trim()
+                val wanted = if (mode == "preserve") xsdWhitespacePreserve else if (mode == "replace") xsdWhitespaceReplace else if (mode == "collapse") xsdWhitespaceCollapse else -1
+                if (wanted < 0 || wanted < t.whitespace) {
+                    fail(node, "xs:whiteSpace '$value' here")
+                    return
+                }
+                t.whitespace = wanted
+            }
+            else -> unsupported(node, "the facet xs:${node.localName}")
+        }
+        if (!ordered && (node.localName == "length" || node.localName == "minLength" || node.localName == "maxLength") &&
+            !(xsdPrimitiveIsStringLike(t.primitive) || t.primitive == xsdPrimitiveHex || t.primitive == xsdPrimitiveBase64)) {
+            unsupported(node, "xs:${node.localName} on this type")
+        }
+        return
+    }
+
+    // --- Elements and complex types ---
+
+    fun addElement(decl: XsdElementDecl): int {
+        schema.elements.append(decl)
+        schema.elements.size - 1
+    }
+
+    // The global element a QName names, made when first needed.
+    fun globalElement(doc: XsdSchemaDocument, namespace: string, localName: string, node: XmlElement): int {
+        val key = xsdKey(namespace, localName)
+        val done = schema.globalElements.get(key)
+        if (done != null) return done
+        val at = doc.topLevel.get("element $key")
+        if (at == null) {
+            fail(node, "no global element $localName${if (namespace != "") " in $namespace" else ""}")
+            return -1
+        }
+        val top = doc.topNodes[at]
+        elementDecl(doc, top, scopeOf(scopeOf(XsdScope([], []), doc.root), top), true)
+    }
+
+    // An xs:element declaration (not a reference). A global one is registered before its
+    // type is read, so a content model may refer back to it.
+    fun elementDecl(doc: XsdSchemaDocument, node: XmlElement, outer: XsdScope, global: bool): int {
+        val scope = scopeOf(outer, node)
+        attributesAllowed(node, ["name", "type", "minOccurs", "maxOccurs", "id", "default", "fixed", "form", "block", "final", "abstract", "nillable", "substitutionGroup", "targetNamespace"])
+        if (node.attributeValue("abstract", "false").trim() == "true") unsupported(node, "abstract elements")
+        if (node.attributeValue("nillable", "false").trim() == "true") unsupported(node, "nillable elements (xsi:nil)")
+        if (node.attribute("substitutionGroup") != null) unsupported(node, "substitution groups")
+        if (node.attribute("targetNamespace") != null) unsupported(node, "targetNamespace on an element")
+        val name = node.attributeValue("name").trim()
+        if (!xmlIsNcName(name)) {
+            fail(node, "an element needs a name")
+            return -1
+        }
+        var qualified = global || elementQualified
+        val form = node.attribute("form")
+        if (form != null) qualified = form.value.trim() == "qualified"
+        val namespace = if (qualified) schema.targetNamespace else ""
+        val defaultValue = node.attribute("default")
+        val fixedValue = node.attribute("fixed")
+        if (defaultValue != null && fixedValue != null) fail(node, "an element can't have both default and fixed")
+        val index = addElement(XsdElementDecl(name, namespace, 0, -1, [], defaultValue?.value ?? "", defaultValue != null,
+            fixedValue?.value ?? "", fixedValue != null, node.line))
+        if (global) schema.globalElements.set(xsdKey(namespace, name), index)
+        val typeName = node.attribute("type")
+        val parts = children(node)
+        var inline = 0
+        for (part in parts) {
+            if (part.localName == "simpleType" || part.localName == "complexType") {
+                inline = inline + 1
+                if (typeName != null) fail(part, "an element with a type attribute can't have its own type")
+            }
+        }
+        if (inline > 1) fail(node, "an element has one type")
+        if (typeName != null) {
+            val q = resolve(scope, typeName.value, node)
+            if (q.ok) {
+                val key = xsdKey(q.namespace, q.localName)
+                if (q.namespace != xsdNamespace && doc.topLevel.has("complexType $key")) {
+                    schema.elements[index].typeKind = xsdTypeComplex
+                    schema.elements[index].typeIndex = complexTypeNamed(doc, q.namespace, q.localName, node)
+                } else if (q.namespace == xsdNamespace && q.localName == "anyType") {
+                    unsupported(node, "xs:anyType")
+                } else {
+                    schema.elements[index].typeKind = xsdTypeSimple
+                    schema.elements[index].typeIndex = simpleTypeNamed(doc, q.namespace, q.localName, node)
+                }
+            }
+        } else if (inline == 0) {
+            unsupported(node, "an element without a type (xs:anyType)")
+        }
+        for (part in parts) {
+            when (part.localName) {
+                "simpleType" -> {
+                    schema.elements[index].typeKind = xsdTypeSimple
+                    schema.elements[index].typeIndex = simpleType(doc, part, scope, "", "")
+                }
+                "complexType" -> {
+                    schema.elements[index].typeKind = xsdTypeComplex
+                    schema.elements[index].typeIndex = complexType(doc, part, scope, "", "")
+                }
+                "unique", "key", "keyref" -> {
+                    val identity = identityConstraint(part, scope, index)
+                    if (identity >= 0) schema.elements[index].identities.append(identity)
+                }
+                "alternative" -> unsupported(part, "xs:alternative (type alternatives)")
+                else -> fail(part, "xs:${part.localName} in xs:element")
+            }
+        }
+        val t = schema.elements[index]
+        if ((t.hasDefault || t.hasFixed) && t.typeKind == xsdTypeComplex && t.typeIndex >= 0 &&
+            schema.complexTypes[t.typeIndex].content != xsdContentSimple) unsupported(node, "a default or fixed value for an element without simple content")
+        index
+    }
+
+    fun complexTypeNamed(doc: XsdSchemaDocument, namespace: string, localName: string, node: XmlElement): int {
+        val key = xsdKey(namespace, localName)
+        val done = complexByName.get(key)
+        if (done != null) return done
+        val at = doc.topLevel.get("complexType $key")
+        if (at == null) {
+            fail(node, "no complex type $localName")
+            return -1
+        }
+        val top = doc.topNodes[at]
+        complexType(doc, top, scopeOf(scopeOf(XsdScope([], []), doc.root), top), localName, namespace)
+    }
+
+    fun complexType(doc: XsdSchemaDocument, node: XmlElement, outer: XsdScope, name: string, namespace: string): int {
+        val scope = scopeOf(outer, node)
+        attributesAllowed(node, ["name", "id", "mixed", "final", "block", "abstract", "defaultAttributesApply"])
+        if (node.attributeValue("abstract", "false").trim() == "true") unsupported(node, "abstract complex types")
+        val mixed = node.attributeValue("mixed", "false").trim() == "true"
+        schema.complexTypes.append(XsdComplexType(name, namespace, if (mixed) xsdContentMixed else xsdContentEmpty, -1, -1, [], [], node.line))
+        val index = schema.complexTypes.size - 1
+        if (name != "") complexByName.set(xsdKey(namespace, name), index)
+        var particle: XsdParticle? = null
+        for (part in children(node)) {
+            when (part.localName) {
+                "sequence", "choice", "all" -> {
+                    if (particle != null) fail(part, "a complex type has one model group")
+                    particle = group(doc, part, scope)
+                }
+                "attribute" -> attribute(doc, part, scope, index)
+                "assert" -> assertion(part, scope, index)
+                "simpleContent" -> simpleContent(doc, part, scope, index)
+                "complexContent" -> unsupported(part, "xs:complexContent (derived complex types)")
+                "group" -> unsupported(part, "xs:group")
+                "attributeGroup" -> unsupported(part, "xs:attributeGroup")
+                "anyAttribute" -> unsupported(part, "xs:anyAttribute")
+                "openContent" -> unsupported(part, "xs:openContent")
+                else -> fail(part, "xs:${part.localName} in xs:complexType")
+            }
+        }
+        val found = particle
+        if (found != null) {
+            if (schema.complexTypes[index].content == xsdContentSimple) fail(node, "simple content with a model group")
+            if (!mixed) schema.complexTypes[index].content = xsdContentElements
+            schema.complexTypes[index].model = model(found, node)
+        } else if (mixed) {
+            // Mixed with no elements: text only, no element children.
+            schema.complexTypes[index].model = model(XsdParticleGroup(0, [], 1, 1), node)
+        }
+        index
+    }
+
+    fun simpleContent(doc: XsdSchemaDocument, node: XmlElement, outer: XsdScope, index: int): void {
+        val scope = scopeOf(outer, node)
+        attributesAllowed(node, ["id"])
+        val parts = children(node)
+        if (parts.size != 1 || parts[0].localName != "extension") {
+            unsupported(node, "xs:simpleContent other than an xs:extension of a simple type")
+            return
+        }
+        val extension = parts[0]
+        val inner = scopeOf(scope, extension)
+        attributesAllowed(extension, ["base", "id"])
+        val base = resolve(inner, extension.attributeValue("base"), extension)
+        if (!base.ok) return
+        if (base.namespace != xsdNamespace && doc.topLevel.has("complexType ${xsdKey(base.namespace, base.localName)}")) {
+            unsupported(extension, "xs:simpleContent extending a complex type")
+            return
+        }
+        schema.complexTypes[index].content = xsdContentSimple
+        schema.complexTypes[index].simpleType = simpleTypeNamed(doc, base.namespace, base.localName, extension)
+        for (part in children(extension)) {
+            when (part.localName) {
+                "attribute" -> attribute(doc, part, inner, index)
+                "assert" -> assertion(part, inner, index)
+                else -> unsupported(part, "xs:${part.localName} in xs:extension")
+            }
+        }
+        return
+    }
+
+    fun attribute(doc: XsdSchemaDocument, node: XmlElement, outer: XsdScope, owner: int): void {
+        val scope = scopeOf(outer, node)
+        attributesAllowed(node, ["name", "type", "use", "default", "fixed", "form", "id", "ref", "inheritable"])
+        if (node.attribute("ref") != null) {
+            unsupported(node, "attribute references")
+            return
+        }
+        val name = node.attributeValue("name").trim()
+        if (!xmlIsNcName(name)) {
+            fail(node, "an attribute needs a name")
+            return
+        }
+        var qualified = attributeQualified
+        val form = node.attribute("form")
+        if (form != null) qualified = form.value.trim() == "qualified"
+        val namespace = if (qualified) schema.targetNamespace else ""
+        val use = node.attributeValue("use", "optional").trim()
+        if (use == "prohibited") return
+        if (use != "optional" && use != "required") fail(node, "use '$use'")
+        var simple = builtins.get("anySimpleType") ?? 0
+        val typeName = node.attribute("type")
+        if (typeName != null) {
+            val q = resolve(scope, typeName.value, node)
+            if (q.ok) simple = simpleTypeNamed(doc, q.namespace, q.localName, node)
+        }
+        for (part in children(node)) {
+            if (part.localName == "simpleType" && typeName == null) simple = simpleType(doc, part, scope, "", "")
+            else fail(part, "xs:${part.localName} in xs:attribute")
+        }
+        val fixed = node.attribute("fixed")
+        schema.complexTypes[owner].attributes.append(XsdAttributeUse(name, namespace, simple, use == "required", fixed?.value ?? "", fixed != null))
+        return
+    }
+
+    fun assertion(node: XmlElement, outer: XsdScope, owner: int): void {
+        val scope = scopeOf(outer, node)
+        attributesAllowed(node, ["test", "id", "xpathDefaultNamespace"])
+        if (node.attribute("xpathDefaultNamespace") != null) {
+            unsupported(node, "xpathDefaultNamespace")
+            return
+        }
+        val test = node.attribute("test")
+        if (test == null) {
+            fail(node, "xs:assert needs a test")
+            return
+        }
+        val compiled = xsdXpathCompile(test.value, prefixesOf(scope))
+        if (compiled.error != "") {
+            fail(node, "assertion: ${compiled.error}")
+            return
+        }
+        schema.complexTypes[owner].assertions.append(XsdAssertion(test.value.trim(), compiled.expression, node.line))
+        return
+    }
+
+    fun identityConstraint(node: XmlElement, outer: XsdScope, element: int): int {
+        val scope = scopeOf(outer, node)
+        attributesAllowed(node, ["name", "id", "refer", "ref"])
+        if (node.attribute("ref") != null) {
+            unsupported(node, "a reference to an identity constraint")
+            return -1
+        }
+        val kind = if (node.localName == "unique") xsdIdentityUnique else if (node.localName == "key") xsdIdentityKey else xsdIdentityKeyref
+        val name = node.attributeValue("name").trim()
+        val prefixes = prefixesOf(scope)
+        var selector: array<XsdIdentityPath> = []
+        val fields: array<array<XsdIdentityPath>> = []
+        for (part in children(node)) {
+            attributesAllowed(part, ["xpath", "id", "xpathDefaultNamespace"])
+            if (part.attribute("xpathDefaultNamespace") != null) unsupported(part, "xpathDefaultNamespace")
+            val xpath = part.attributeValue("xpath")
+            if (part.localName == "selector") {
+                val compiled = xsdIdentityPathCompile(xpath, prefixes, false)
+                if (compiled.error != "") fail(part, compiled.error)
+                selector = compiled.paths
+            } else if (part.localName == "field") {
+                val compiled = xsdIdentityPathCompile(xpath, prefixes, true)
+                if (compiled.error != "") fail(part, compiled.error)
+                fields.append(compiled.paths)
+            } else {
+                fail(part, "xs:${part.localName} in xs:${node.localName}")
+            }
+        }
+        if (selector.size == 0 || fields.size == 0) fail(node, "xs:${node.localName} needs a selector and fields")
+        val key = xsdKey(schema.targetNamespace, name)
+        if (identityByName.has(key)) fail(node, "a second identity constraint named $name")
+        schema.identities.append(XsdIdentity(kind, name, schema.targetNamespace, -1, selector, fields, element, node.line))
+        for (p in selector) schema.selectorNames.set(if (p.steps.size == 0) "*" else p.steps[p.steps.size - 1].localName, true)
+        val index = schema.identities.size - 1
+        identityByName.set(key, index)
+        if (kind == xsdIdentityKeyref) {
+            val refer = resolve(scope, node.attributeValue("refer"), node)
+            // Resolved once every constraint is known: refer may name a later one.
+            referNames.append(xsdKey(refer.namespace, refer.localName))
+            referOwners.append(index)
+            referLines.append(node.line)
+        }
+        index
+    }
+
+    // --- Content models ---
+
+    fun group(doc: XsdSchemaDocument, node: XmlElement, outer: XsdScope): XsdParticle {
+        val scope = scopeOf(outer, node)
+        attributesAllowed(node, ["id", "minOccurs", "maxOccurs"])
+        val kind = if (node.localName == "sequence") 0 else if (node.localName == "choice") 1 else 2
+        val min = occurs(node, "minOccurs", 1)
+        val max = occurs(node, "maxOccurs", 1)
+        if (max >= 0 && max < min) fail(node, "maxOccurs is below minOccurs")
+        val items: array<XsdParticle> = []
+        for (part in children(node)) {
+            when (part.localName) {
+                "element" -> {
+                    val p = elementParticle(doc, part, scope)
+                    if (p != null) items.append(p)
+                }
+                "sequence", "choice" -> {
+                    if (kind == 2) fail(part, "xs:all holds elements only")
+                    items.append(group(doc, part, scope))
+                }
+                "all" -> fail(part, "xs:all can't be inside another group")
+                "any" -> unsupported(part, "xs:any (wildcards)")
+                "group" -> unsupported(part, "xs:group")
+                else -> fail(part, "xs:${part.localName} in xs:${node.localName}")
+            }
+        }
+        if (kind == 2 && (max != 1 || min > 1)) fail(node, "xs:all occurs at most once")
+        XsdParticleGroup(kind, items, min, max)
+    }
+
+    fun elementParticle(doc: XsdSchemaDocument, node: XmlElement, scope: XsdScope): XsdParticle? {
+        val min = occurs(node, "minOccurs", 1)
+        val max = occurs(node, "maxOccurs", 1)
+        if (max >= 0 && max < min) fail(node, "maxOccurs is below minOccurs")
+        val ref = node.attribute("ref")
+        if (ref != null) {
+            for (a in node.attributes) {
+                if (a.namespaceUri == "" && a.localName != "ref" && a.localName != "minOccurs" && a.localName != "maxOccurs" && a.localName != "id") {
+                    fail(node, "an element reference can't have ${a.localName}")
+                }
+            }
+            val q = resolve(scopeOf(scope, node), ref.value, node)
+            if (!q.ok) return null
+            val decl = globalElement(doc, q.namespace, q.localName, node)
+            if (decl < 0) return null
+            return XsdParticleElement(decl, min, max)
+        }
+        val decl = elementDecl(doc, node, scope, false)
+        if (decl < 0) return null
+        XsdParticleElement(decl, min, max)
+    }
+
+    fun model(particle: XsdParticle, node: XmlElement): int {
+        when (particle) {
+            is XsdParticleGroup -> {
+                if (particle.kind == 2) return allModel(particle, node)
+            }
+            else -> {}
+        }
+        val builder = XsdModelBuilder([], [], [], 0)
+        val start = builder.state()
+        val accept = builder.state()
+        builder.build(particle, start, accept)
+        states = states + builder.eps.size
+        if (builder.overflow || states > xsdMaxModelStates) {
+            fail(node, "the content model expands to more than $xsdMaxModelStates states")
+            return -1
+        }
+        schema.models.append(XsdModel(false, builder.edgeDecl, builder.edgeTo, builder.closures(), start, accept, [], [], [], false))
+        schema.models.size - 1
+    }
+
+    fun allModel(group: XsdParticleGroup, node: XmlElement): int {
+        val decls: array<int> = []
+        val mins: array<int> = []
+        val maxes: array<int> = []
+        for (item in group.items) {
+            when (item) {
+                is XsdParticleElement -> {
+                    for (d in decls) {
+                        if (schema.elements[d].name == schema.elements[item.decl].name && schema.elements[d].namespace == schema.elements[item.decl].namespace) {
+                            fail(node, "xs:all names ${schema.elements[d].name} twice")
+                        }
+                    }
+                    decls.append(item.decl)
+                    mins.append(item.min)
+                    maxes.append(item.max)
+                }
+                else -> fail(node, "xs:all holds elements only")
+            }
+        }
+        schema.models.append(XsdModel(true, [], [], [], 0, 0, decls, mins, maxes, group.min == 0))
+        schema.models.size - 1
+    }
+}
+
+// Builds a content model's automaton, Thompson style, expanding occurrence bounds.
+class XsdModelBuilder(
+    val eps: array<array<int>>,
+    val edgeDecl: array<array<int>>,
+    val edgeTo: array<array<int>>,
+    var count: int,
+    var overflow: bool = false
+) {
+    fun state(): int {
+        if (eps.size >= xsdMaxModelStates) {
+            overflow = true
+            return 0
+        }
+        eps.append([])
+        edgeDecl.append([])
+        edgeTo.append([])
+        eps.size - 1
+    }
+
+    fun epsilon(from: int, to: int): void {
+        eps[from].append(to)
+        return
+    }
+
+    // Moves from `from` to `to` through one occurrence of the particle's body.
+    fun once(particle: XsdParticle, from: int, to: int): void {
+        if (overflow) return
+        when (particle) {
+            is XsdParticleElement -> {
+                edgeDecl[from].append(particle.decl)
+                edgeTo[from].append(to)
+            }
+            is XsdParticleGroup -> {
+                if (particle.kind == 1) {
+                    if (particle.items.size == 0) return
+                    for (item in particle.items) build(item, from, to)
+                } else {
+                    var at = from
+                    var i = 0
+                    while (i < particle.items.size) {
+                        val next = if (i + 1 == particle.items.size) to else state()
+                        build(particle.items[i], at, next)
+                        at = next
+                        i = i + 1
+                    }
+                    if (particle.items.size == 0) epsilon(from, to)
+                }
+            }
+        }
+        return
+    }
+
+    // Moves from `from` to `to` through the particle with its occurrence bounds.
+    fun build(particle: XsdParticle, from: int, to: int): void {
+        var min = 1
+        var max = 1
+        when (particle) {
+            is XsdParticleElement -> { min = particle.min; max = particle.max }
+            is XsdParticleGroup -> { min = particle.min; max = particle.max }
+        }
+        if (max == 0) {
+            epsilon(from, to)
+            return
+        }
+        var at = from
+        var i = 0
+        while (i < min && !overflow) {
+            val next = if (i + 1 == min && max == min) to else state()
+            once(particle, at, next)
+            at = next
+            i = i + 1
+        }
+        if (max == min) return
+        if (max < 0) {
+            // A loop: as many more as wanted.
+            val loop = state()
+            epsilon(at, loop)
+            once(particle, loop, loop)
+            epsilon(loop, to)
+            return
+        }
+        while (i < max && !overflow) {
+            epsilon(at, to)
+            val next = if (i + 1 == max) to else state()
+            once(particle, at, next)
+            at = next
+            i = i + 1
+        }
+        return
+    }
+
+    // What each state reaches without taking an element, itself included.
+    fun closures(): array<array<int>> {
+        val result: array<array<int>> = []
+        val marks = filledArray(eps.size, -1)
+        val stack: array<int> = []
+        var s = 0
+        while (s < eps.size) {
+            val reached: array<int> = []
+            stack.clear()
+            stack.append(s)
+            while (stack.size > 0) {
+                val at = stack[stack.size - 1]
+                stack.truncate(stack.size - 1)
+                if (marks[at] == s) continue
+                marks[at] = s
+                reached.append(at)
+                for (next in eps[at]) stack.append(next)
+            }
+            result.append(reached)
+            s = s + 1
+        }
+        result
+    }
+}
+
+// Loads a schema from its bytes. `options` bound the schema document as any other; a DTD
+// in it is allowed only if they allow one.
+fun xsdLoad(source: string, options: XmlOptions = XmlOptions()): XsdSchemaResult {
+    val parsed = xmlParse(source, options)
+    val failure = parsed.error
+    if (failure != null) return XsdSchemaResult(false, null, "the schema isn't well-formed: ${failure.code} at ${failure.line}:${failure.column}")
+    val document = parsed.document
+    if (document == null) return XsdSchemaResult(false, null, "no schema")
+    val root = document.root
+    if (root.namespaceUri != xsdNamespace || root.localName != "schema") return XsdSchemaResult(false, null, "the root isn't xs:schema")
+    if (document.skippedEntities > 0) return XsdSchemaResult(false, null, "the schema refers to entities that weren't read")
+    val schema = XsdSchema(root.attributeValue("targetNamespace"), [], [], [], [], [], [], Map(), Map())
+    val doc = XsdSchemaDocument(root, Map(), [])
+    val loader = XsdLoader(schema, Map(), Map(), Map(), Map(), Map(), [], [], [])
+    loader.attributesAllowed(root, ["targetNamespace", "elementFormDefault", "attributeFormDefault", "version", "id", "blockDefault", "finalDefault", "defaultAttributes", "xpathDefaultNamespace"])
+    if (root.attribute("defaultAttributes") != null) loader.unsupported(root, "defaultAttributes")
+    if (root.attribute("xpathDefaultNamespace") != null) loader.unsupported(root, "xpathDefaultNamespace")
+    loader.elementQualified = root.attributeValue("elementFormDefault", "unqualified").trim() == "qualified"
+    loader.attributeQualified = root.attributeValue("attributeFormDefault", "unqualified").trim() == "qualified"
+    loader.addBuiltins()
+    if (!loader.included(root)) return XsdSchemaResult(false, null, "the schema is for another version of XSD")
+    // Register the top level by name first, so references may point forwards.
+    for (child in loader.children(root)) {
+        val kind = child.localName
+        if (kind == "element" || kind == "simpleType" || kind == "complexType") {
+            val name = child.attributeValue("name").trim()
+            val key = "$kind ${xsdKey(schema.targetNamespace, name)}"
+            if (doc.topLevel.has(key)) loader.fail(child, "a second top-level $kind named $name")
+            doc.topNodes.append(child)
+            doc.topLevel.set(key, doc.topNodes.size - 1)
+            if (kind == "simpleType" && doc.topLevel.has("complexType ${xsdKey(schema.targetNamespace, name)}") ||
+                kind == "complexType" && doc.topLevel.has("simpleType ${xsdKey(schema.targetNamespace, name)}")) loader.fail(child, "a simple and a complex type both named $name")
+        } else if (kind == "include" || kind == "import" || kind == "redefine" || kind == "override") {
+            loader.unsupported(child, "xs:$kind: a schema is one document here")
+        } else {
+            loader.unsupported(child, "the top-level xs:$kind")
+        }
+    }
+    // Then build everything, so a component nothing refers to is still checked.
+    var i = 0
+    while (i < doc.topNodes.size && loader.error == "") {
+        val node = doc.topNodes[i]
+        val name = node.attributeValue("name").trim()
+        when (node.localName) {
+            "element" -> loader.globalElement(doc, schema.targetNamespace, name, node)
+            "simpleType" -> loader.simpleTypeNamed(doc, schema.targetNamespace, name, node)
+            else -> loader.complexTypeNamed(doc, schema.targetNamespace, name, node)
+        }
+        i = i + 1
+    }
+    var r = 0
+    while (r < loader.referOwners.size && loader.error == "") {
+        val target = loader.identityByName.get(loader.referNames[r])
+        if (target == null || schema.identities[target].kind == xsdIdentityKeyref) {
+            loader.error = "line ${loader.referLines[r]}: refer names no key or unique constraint"
+        } else {
+            val owner = loader.referOwners[r]
+            schema.identities[owner].refer = target
+            if (schema.identities[target].fields.size != schema.identities[owner].fields.size) loader.error = "line ${loader.referLines[r]}: the keyref has another number of fields than its key"
+            // The node table a keyref reads is its own element's here: a key declared on a
+            // descendant isn't propagated.
+            if (schema.identities[target].element != schema.identities[owner].element) loader.error = "line ${loader.referLines[r]}: unsupported: a keyref referring to a key on another element"
+        }
+        r = r + 1
+    }
+    for (regex in schema.regexes) if (loader.error == "" && regex.error != "") loader.error = "pattern '${regex.source}': ${regex.error}"
+    if (loader.error != "") return XsdSchemaResult(false, null, loader.error)
+    XsdSchemaResult(true, schema, "")
+}

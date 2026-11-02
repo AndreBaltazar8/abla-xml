@@ -14,7 +14,7 @@ all: unit conformance written fuzz
 test: unit
 
 unit:
-	$(COMPILER) test tests/writer_test.ab tests/reader_test.ab tests/roundtrip_test.ab tests/stream_test.ab
+	$(COMPILER) test tests/writer_test.ab tests/reader_test.ab tests/roundtrip_test.ab tests/stream_test.ab tests/xsd_test.ab tests/xsd_regex_test.ab
 
 conformance:
 	mkdir -p $(BUILD_DIR)

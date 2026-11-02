@@ -6,4 +6,4 @@ import "reader.ab"
 import "parse.ab"
 import "file.ab"
 
-fun xmlPackageVersion(): string = "0.2.0"
+fun xmlPackageVersion(): string = "0.3.0"

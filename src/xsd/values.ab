@@ -1,0 +1,502 @@
+// The values of XSD's built-in datatypes that this validator supports: lexical forms,
+// how values compare, and the canonical key that identity constraints compare by.
+// No floating point: decimals are compared as digits.
+import "abla/text"
+import "abla/bytes"
+import "../chars.ab"
+
+// Primitive types, and the families comparisons go by.
+val xsdPrimitiveAny = 0
+val xsdPrimitiveString = 1
+val xsdPrimitiveBoolean = 2
+val xsdPrimitiveDecimal = 3
+val xsdPrimitiveDate = 4
+val xsdPrimitiveDateTime = 5
+val xsdPrimitiveTime = 6
+val xsdPrimitiveGYear = 7
+val xsdPrimitiveGYearMonth = 8
+val xsdPrimitiveAnyUri = 9
+val xsdPrimitiveBase64 = 10
+val xsdPrimitiveHex = 11
+val xsdPrimitiveDouble = 12
+val xsdPrimitiveFloat = 13
+val xsdPrimitiveDuration = 14
+val xsdPrimitiveGMonthDay = 15
+val xsdPrimitiveGDay = 16
+val xsdPrimitiveGMonth = 17
+// Not a datatype: what an XPath literal or an element without a simple type gives.
+val xsdPrimitiveUntyped = 18
+
+val xsdWhitespacePreserve = 0
+val xsdWhitespaceReplace = 1
+val xsdWhitespaceCollapse = 2
+
+// Whether values of the type are ordered here (the bounds facets need it).
+fun xsdPrimitiveOrdered(primitive: int): bool =
+    primitive == xsdPrimitiveDecimal || primitive == xsdPrimitiveDate || primitive == xsdPrimitiveDateTime ||
+    primitive == xsdPrimitiveTime || primitive == xsdPrimitiveGYear || primitive == xsdPrimitiveGYearMonth
+
+fun xsdPrimitiveIsStringLike(primitive: int): bool =
+    primitive == xsdPrimitiveString || primitive == xsdPrimitiveAny || primitive == xsdPrimitiveAnyUri ||
+    primitive == xsdPrimitiveUntyped
+
+fun xsdPrimitiveIsTimeLike(primitive: int): bool =
+    primitive == xsdPrimitiveDate || primitive == xsdPrimitiveDateTime || primitive == xsdPrimitiveTime ||
+    primitive == xsdPrimitiveGYear || primitive == xsdPrimitiveGYearMonth
+
+// --- Whitespace ------------------------------------------------------------------------
+
+fun xsdNormalizeWhitespace(text: string, mode: int): string {
+    if (mode == xsdWhitespacePreserve) return text
+    var plain = true
+    for (c in text) if (c == 9 || c == 10 || c == 13 || (mode == xsdWhitespaceCollapse && c == 32)) { plain = false; break }
+    if (plain) return text
+    val out = byteBuffer()
+    if (mode == xsdWhitespaceReplace) {
+        for (c in text) out.appendByteValue(if (c == 9 || c == 10 || c == 13) 32 else c)
+        return out.toText()
+    }
+    var pendingSpace = false
+    for (c in text) {
+        if (c == 9 || c == 10 || c == 13 || c == 32) {
+            if (out.size() > 0) pendingSpace = true
+        } else {
+            if (pendingSpace) out.appendByteValue(32)
+            pendingSpace = false
+            out.appendByteValue(c)
+        }
+    }
+    out.toText()
+}
+
+// Characters, as XSD's length facets count a string.
+fun xsdCodePoints(text: string): int {
+    var count = 0
+    for (c in text) if ((c & 0xC0) != 0x80) count = count + 1
+    count
+}
+
+// --- Decimals --------------------------------------------------------------------------
+
+// A decimal as sign and digits, with no leading zeros in `whole` and no trailing zeros in
+// `fraction`. Zero is positive, with both empty.
+class XsdDecimal(val ok: bool, val negative: bool, val whole: string, val fraction: string)
+
+private fun xsdIsDigit(c: int): bool = c >= 48 && c <= 57
+
+// xs:decimal's lexical form: an optional sign, digits, and an optional point with digits on
+// at least one side. `integerOnly` refuses the point, as xs:integer does.
+fun xsdDecimalParse(text: string, integerOnly: bool = false): XsdDecimal {
+    var i = 0
+    var negative = false
+    if (text.size > 0 && (text[0] == 43 || text[0] == 45)) {
+        negative = text[0] == 45
+        i = 1
+    }
+    val wholeStart = i
+    while (i < text.size && xsdIsDigit(text[i])) i = i + 1
+    val wholeEnd = i
+    var fractionStart = i
+    var fractionEnd = i
+    if (i < text.size && text[i] == 46) {
+        if (integerOnly) return XsdDecimal(false, false, "", "")
+        i = i + 1
+        fractionStart = i
+        while (i < text.size && xsdIsDigit(text[i])) i = i + 1
+        fractionEnd = i
+    }
+    if (i != text.size || (wholeEnd == wholeStart && fractionEnd == fractionStart)) return XsdDecimal(false, false, "", "")
+    var w = wholeStart
+    while (w < wholeEnd && text[w] == 48) w = w + 1
+    var f = fractionEnd
+    while (f > fractionStart && text[f - 1] == 48) f = f - 1
+    val whole = text.slice(w, wholeEnd)
+    val fraction = text.slice(fractionStart, f)
+    XsdDecimal(true, negative && (whole.size > 0 || fraction.size > 0), whole, fraction)
+}
+
+private fun xsdCompareMagnitude(a: XsdDecimal, b: XsdDecimal): int {
+    if (a.whole.size != b.whole.size) return if (a.whole.size < b.whole.size) -1 else 1
+    if (a.whole != b.whole) return if (a.whole < b.whole) -1 else 1
+    if (a.fraction == b.fraction) return 0
+    if (a.fraction < b.fraction) -1 else 1
+}
+
+fun xsdDecimalCompare(a: XsdDecimal, b: XsdDecimal): int {
+    if (a.negative != b.negative) return if (a.negative) -1 else 1
+    val magnitude = xsdCompareMagnitude(a, b)
+    if (a.negative) -magnitude else magnitude
+}
+
+fun xsdDecimalCanonical(d: XsdDecimal): string {
+    val whole = if (d.whole.size == 0) "0" else d.whole
+    val sign = if (d.negative) "-" else ""
+    if (d.fraction.size == 0) "$sign$whole" else "$sign$whole.${d.fraction}"
+}
+
+// totalDigits as XSD counts them: significant digits, at least one.
+fun xsdDecimalTotalDigits(d: XsdDecimal): int {
+    val count = d.whole.size + d.fraction.size
+    if (count == 0) 1 else count
+}
+
+// --- Dates and times --------------------------------------------------------------------
+
+// A point in time, as seconds from 1970 (as if UTC when there is no zone), the fraction of
+// the second as digits without trailing zeros, and whether a zone was given.
+class XsdMoment(val ok: bool, val seconds: int, val fraction: string, val zoned: bool)
+
+private val XSD_BAD_MOMENT = XsdMoment(false, 0, "", false)
+
+private fun xsdDigitsAt(text: string, start: int, count: int): int {
+    if (start + count > text.size) return -1
+    var value = 0
+    var i = start
+    while (i < start + count) {
+        if (!xsdIsDigit(text[i])) return -1
+        value = value * 10 + (text[i] - 48)
+        i = i + 1
+    }
+    value
+}
+
+fun xsdLeapYear(year: int): bool = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+
+fun xsdDaysInMonth(year: int, month: int): int {
+    if (month == 2) return if (xsdLeapYear(year)) 29 else 28
+    if (month == 4 || month == 6 || month == 9 || month == 11) 30 else 31
+}
+
+// Days from 1970-01-01 to the date, in the proleptic Gregorian calendar (year 0 is 1 BCE,
+// as XSD 1.1 counts).
+fun xsdDaysFromCivil(year: int, month: int, day: int): int {
+    val y = if (month <= 2) year - 1 else year
+    val era = (if (y >= 0) y else y - 399) / 400
+    val yoe = y - era * 400
+    val mp = (month + 9) % 12
+    val doy = (153 * mp + 2) / 5 + day - 1
+    val doe = yoe * 365 + yoe / 4 - yoe / 100 + doy
+    era * 146097 + doe - 719468
+}
+
+class XsdYearAt(val year: int, val next: int)
+
+// A year: optional minus, at least four digits, no leading zero beyond four; years past
+// a billion are refused rather than compared wrongly.
+private fun xsdYear(text: string): XsdYearAt {
+    var i = 0
+    var negative = false
+    if (text.size > 0 && text[0] == 45) {
+        negative = true
+        i = 1
+    }
+    val start = i
+    while (i < text.size && xsdIsDigit(text[i])) i = i + 1
+    val digits = i - start
+    if (digits < 4 || (digits > 4 && text[start] == 48) || digits > 9) return XsdYearAt(0, -1)
+    val year = xsdDigitsAt(text, start, digits)
+    // XSD 1.1: year 0000 is allowed (1 BCE); -0000 isn't.
+    if (negative && year == 0) return XsdYearAt(0, -1)
+    XsdYearAt(if (negative) -year else year, i)
+}
+
+class XsdZoneAt(val ok: bool, val zoned: bool, val minutes: int)
+
+// An optional zone, from `at` to the end: Z, or +hh:mm / -hh:mm within 14:00.
+private fun xsdZone(text: string, at: int): XsdZoneAt {
+    if (at == text.size) return XsdZoneAt(true, false, 0)
+    if (text[at] == 90) return XsdZoneAt(at + 1 == text.size, true, 0)
+    if (text[at] != 43 && text[at] != 45) return XsdZoneAt(false, false, 0)
+    if (at + 6 != text.size || text[at + 3] != 58) return XsdZoneAt(false, false, 0)
+    val hours = xsdDigitsAt(text, at + 1, 2)
+    val minutes = xsdDigitsAt(text, at + 4, 2)
+    if (hours < 0 || minutes < 0 || minutes > 59 || hours > 14 || (hours == 14 && minutes != 0)) return XsdZoneAt(false, false, 0)
+    val total = hours * 60 + minutes
+    XsdZoneAt(true, true, if (text[at] == 45) -total else total)
+}
+
+class XsdClockAt(val ok: bool, val seconds: int, val fraction: string, val next: int, val midnight24: bool)
+
+// hh:mm:ss(.s+)? at `at`.
+private fun xsdClock(text: string, at: int): XsdClockAt {
+    val bad = XsdClockAt(false, 0, "", 0, false)
+    if (at + 8 > text.size || text[at + 2] != 58 || text[at + 5] != 58) return bad
+    val hour = xsdDigitsAt(text, at, 2)
+    val minute = xsdDigitsAt(text, at + 3, 2)
+    val second = xsdDigitsAt(text, at + 6, 2)
+    if (hour < 0 || minute < 0 || second < 0 || minute > 59 || second > 59 || hour > 24) return bad
+    var i = at + 8
+    var fraction = ""
+    if (i < text.size && text[i] == 46) {
+        val start = i + 1
+        i = start
+        while (i < text.size && xsdIsDigit(text[i])) i = i + 1
+        if (i == start) return bad
+        var end = i
+        while (end > start && text[end - 1] == 48) end = end - 1
+        fraction = text.slice(start, end)
+    }
+    if (hour == 24 && (minute != 0 || second != 0 || fraction != "")) return bad
+    XsdClockAt(true, hour * 3600 + minute * 60 + second, fraction, i, hour == 24)
+}
+
+// The moment a value of a date or time type names; `ok` false when it isn't one.
+fun xsdMoment(primitive: int, text: string): XsdMoment {
+    var year = 1972
+    var month = 12
+    var day = 31
+    var at = 0
+    if (primitive != xsdPrimitiveTime) {
+        val y = xsdYear(text)
+        if (y.next < 0) return XSD_BAD_MOMENT
+        year = y.year
+        at = y.next
+        month = 1
+        day = 1
+        if (primitive != xsdPrimitiveGYear) {
+            if (at + 3 > text.size || text[at] != 45) return XSD_BAD_MOMENT
+            month = xsdDigitsAt(text, at + 1, 2)
+            if (month < 1 || month > 12) return XSD_BAD_MOMENT
+            at = at + 3
+            if (primitive != xsdPrimitiveGYearMonth) {
+                if (at + 3 > text.size || text[at] != 45) return XSD_BAD_MOMENT
+                day = xsdDigitsAt(text, at + 1, 2)
+                if (day < 1 || day > xsdDaysInMonth(year, month)) return XSD_BAD_MOMENT
+                at = at + 3
+            }
+        }
+    }
+    var clock = 0
+    var fraction = ""
+    if (primitive == xsdPrimitiveDateTime || primitive == xsdPrimitiveTime) {
+        if (primitive == xsdPrimitiveDateTime) {
+            if (at >= text.size || text[at] != 84) return XSD_BAD_MOMENT
+            at = at + 1
+        }
+        val c = xsdClock(text, at)
+        if (!c.ok) return XSD_BAD_MOMENT
+        clock = c.seconds
+        fraction = c.fraction
+        at = c.next
+    }
+    val zone = xsdZone(text, at)
+    if (!zone.ok) return XSD_BAD_MOMENT
+    val seconds = xsdDaysFromCivil(year, month, day) * 86400 + clock - zone.minutes * 60
+    XsdMoment(true, seconds, fraction, zone.zoned)
+}
+
+private fun xsdMomentOrder(a: XsdMoment, b: XsdMoment): int {
+    if (a.seconds != b.seconds) return if (a.seconds < b.seconds) -1 else 1
+    if (a.fraction == b.fraction) return 0
+    if (a.fraction < b.fraction) -1 else 1
+}
+
+// -1, 0 or 1, or 2 when XSD's partial order of zoned and unzoned values can't say.
+fun xsdMomentCompare(a: XsdMoment, b: XsdMoment): int {
+    if (a.zoned == b.zoned) return xsdMomentOrder(a, b)
+    // One has no zone: it is somewhere within 14 hours of its UTC reading.
+    val span = 14 * 3600
+    val early = if (a.zoned) XsdMoment(true, b.seconds - span, b.fraction, true) else XsdMoment(true, a.seconds - span, a.fraction, true)
+    val late = if (a.zoned) XsdMoment(true, b.seconds + span, b.fraction, true) else XsdMoment(true, a.seconds + span, a.fraction, true)
+    if (a.zoned) {
+        if (xsdMomentOrder(a, early) < 0) return -1
+        if (xsdMomentOrder(a, late) > 0) return 1
+        return 2
+    }
+    if (xsdMomentOrder(late, b) < 0) return -1
+    if (xsdMomentOrder(early, b) > 0) return 1
+    2
+}
+
+// --- Other lexical forms ----------------------------------------------------------------
+
+fun xsdIsBoolean(text: string): bool = text == "true" || text == "false" || text == "1" || text == "0"
+
+fun xsdBooleanValue(text: string): bool = text == "true" || text == "1"
+
+private fun xsdIsHex(c: int): bool = xsdIsDigit(c) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
+
+fun xsdIsHexBinary(text: string): bool {
+    if (text.size % 2 != 0) return false
+    for (c in text) if (!xsdIsHex(c)) return false
+    true
+}
+
+private fun xsdBase64Char(c: int): bool = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || xsdIsDigit(c) || c == 43 || c == 47
+
+// The octets a base64Binary value holds, or -1 when it isn't one. Spaces between
+// characters are allowed, as XSD's grammar allows them singly.
+fun xsdBase64Octets(text: string): int {
+    var count = 0
+    var padding = 0
+    var lastSpace = false
+    for (c in text) {
+        if (c == 32) {
+            if (lastSpace || count == 0) return -1
+            lastSpace = true
+            continue
+        }
+        lastSpace = false
+        if (c == 61) {
+            padding = padding + 1
+            count = count + 1
+        } else {
+            if (padding > 0 || !xsdBase64Char(c)) return -1
+            count = count + 1
+        }
+    }
+    if (lastSpace || count % 4 != 0 || padding > 2) return -1
+    count / 4 * 3 - padding
+}
+
+// xs:double and xs:float: the lexical form only.
+fun xsdIsFloatLexical(text: string): bool {
+    if (text == "INF" || text == "-INF" || text == "+INF" || text == "NaN") return true
+    var i = 0
+    if (text.size > 0 && (text[0] == 43 || text[0] == 45)) i = 1
+    var digits = 0
+    while (i < text.size && xsdIsDigit(text[i])) { i = i + 1; digits = digits + 1 }
+    if (i < text.size && text[i] == 46) {
+        i = i + 1
+        while (i < text.size && xsdIsDigit(text[i])) { i = i + 1; digits = digits + 1 }
+    }
+    if (digits == 0) return false
+    if (i < text.size && (text[i] == 69 || text[i] == 101)) {
+        i = i + 1
+        if (i < text.size && (text[i] == 43 || text[i] == 45)) i = i + 1
+        val start = i
+        while (i < text.size && xsdIsDigit(text[i])) i = i + 1
+        if (i == start) return false
+    }
+    i == text.size
+}
+
+// xs:duration: the lexical form only.
+fun xsdIsDuration(text: string): bool {
+    var i = 0
+    if (text.size > 0 && text[0] == 45) i = 1
+    if (i >= text.size || text[i] != 80) return false
+    i = i + 1
+    var any = false
+    var inTime = false
+    var order = "YMD"
+    var seen = ""
+    while (i < text.size) {
+        if (text[i] == 84) {
+            if (inTime) return false
+            inTime = true
+            order = "HMS"
+            seen = ""
+            i = i + 1
+            if (i == text.size) return false
+            continue
+        }
+        val start = i
+        while (i < text.size && xsdIsDigit(text[i])) i = i + 1
+        if (i == start) return false
+        var designator = if (i < text.size) text[i] else 0
+        if (designator == 46) {
+            if (!inTime) return false
+            i = i + 1
+            val fractionStart = i
+            while (i < text.size && xsdIsDigit(text[i])) i = i + 1
+            if (i == fractionStart || i >= text.size || text[i] != 83) return false
+            designator = 83
+        }
+        if (i >= text.size) return false
+        val letter = text.slice(i, i + 1)
+        val at = order.indexOf(letter)
+        if (at < 0 || seen.size > 0 && order.indexOf(seen) >= at) return false
+        seen = letter
+        any = true
+        i = i + 1
+    }
+    any && !(inTime && seen == "")
+}
+
+private fun xsdGPart(text: string, primitive: int): bool {
+    // --MM-DD, ---DD, --MM, each with an optional zone.
+    var at = 0
+    if (primitive == xsdPrimitiveGDay) {
+        if (!text.startsWith("---")) return false
+        val day = xsdDigitsAt(text, 3, 2)
+        if (day < 1 || day > 31) return false
+        at = 5
+    } else {
+        if (!text.startsWith("--")) return false
+        val month = xsdDigitsAt(text, 2, 2)
+        if (month < 1 || month > 12) return false
+        at = 4
+        if (primitive == xsdPrimitiveGMonthDay) {
+            if (at >= text.size || text[at] != 45) return false
+            val day = xsdDigitsAt(text, 5, 2)
+            if (day < 1 || day > xsdDaysInMonth(2000, month)) return false
+            at = 7
+        }
+    }
+    xsdZone(text, at).ok
+}
+
+// Whether `text`, already whitespace-normalized, is in the lexical space of `primitive`.
+fun xsdLexicalOk(primitive: int, text: string, integerOnly: bool): bool {
+    if (primitive == xsdPrimitiveDecimal) return xsdDecimalParse(text, integerOnly).ok
+    if (primitive == xsdPrimitiveBoolean) return xsdIsBoolean(text)
+    if (xsdPrimitiveIsTimeLike(primitive)) return xsdMoment(primitive, text).ok
+    if (primitive == xsdPrimitiveHex) return xsdIsHexBinary(text)
+    if (primitive == xsdPrimitiveBase64) return xsdBase64Octets(text) >= 0
+    if (primitive == xsdPrimitiveDouble || primitive == xsdPrimitiveFloat) return xsdIsFloatLexical(text)
+    if (primitive == xsdPrimitiveDuration) return xsdIsDuration(text)
+    if (primitive == xsdPrimitiveGMonthDay || primitive == xsdPrimitiveGDay || primitive == xsdPrimitiveGMonth) return xsdGPart(text, primitive)
+    true
+}
+
+// -1, 0 or 1; 2 when the values aren't comparable (another primitive, a partial order, or
+// a value that isn't one). Both are lexical forms already normalized.
+fun xsdCompareValues(primitive: int, a: string, b: string): int {
+    if (primitive == xsdPrimitiveDecimal) {
+        val x = xsdDecimalParse(a)
+        val y = xsdDecimalParse(b)
+        if (!x.ok || !y.ok) return 2
+        return xsdDecimalCompare(x, y)
+    }
+    if (xsdPrimitiveIsTimeLike(primitive)) {
+        val x = xsdMoment(primitive, a)
+        val y = xsdMoment(primitive, b)
+        if (!x.ok || !y.ok) return 2
+        return xsdMomentCompare(x, y)
+    }
+    if (primitive == xsdPrimitiveBoolean) {
+        if (xsdBooleanValue(a) == xsdBooleanValue(b)) return 0
+        return if (xsdBooleanValue(a)) 1 else -1
+    }
+    if (primitive == xsdPrimitiveHex) return if (a.uppercase() == b.uppercase()) 0 else 2
+    if (a == b) return 0
+    if (primitive == xsdPrimitiveString || primitive == xsdPrimitiveAny || primitive == xsdPrimitiveAnyUri || primitive == xsdPrimitiveUntyped) {
+        return if (a < b) -1 else 1
+    }
+    2
+}
+
+// What identity constraints compare: equal keys for equal values of the same primitive.
+fun xsdValueKey(primitive: int, text: string): string {
+    if (primitive == xsdPrimitiveDecimal) {
+        val d = xsdDecimalParse(text)
+        if (d.ok) return "n:${xsdDecimalCanonical(d)}"
+    }
+    if (xsdPrimitiveIsTimeLike(primitive)) {
+        val m = xsdMoment(primitive, text)
+        if (m.ok) return "t$primitive:${m.seconds}.${m.fraction}${if (m.zoned) "Z" else ""}"
+    }
+    if (primitive == xsdPrimitiveBoolean) return if (xsdBooleanValue(text)) "b:1" else "b:0"
+    if (primitive == xsdPrimitiveHex) return "h:${text.uppercase()}"
+    if (primitive == xsdPrimitiveAnyUri) return "u:$text"
+    if (xsdPrimitiveIsStringLike(primitive)) return "s:$text"
+    "$primitive:$text"
+}
+
+// The value of a string of at most 18 decimal digits.
+fun xsdDigitsValue(digits: string): int {
+    var value = 0
+    for (c in digits) if (c >= 48 && c <= 57) value = value * 10 + (c - 48)
+    value
+}

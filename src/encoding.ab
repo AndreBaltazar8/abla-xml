@@ -107,7 +107,12 @@ private fun xmlDecodeSingleByte(source: string, encoding: int): XmlDecoded {
     while (i < source.size) {
         val b = source[i]
         if (b < 0x80) {
-            out.appendByteValue(b)
+            // A run of ASCII at once: appending a byte at a time made decoding most of a read.
+            var end = i + 1
+            while (end < source.size && source[end] < 0x80) end = end + 1
+            out.appendText(source.slice(i, end))
+            i = end
+            continue
         } else if (encoding == xmlEncodingWindows1252 && b <= 0x9F) {
             val cp = xmlWindows1252High(b)
             if (cp == 0) return XmlDecoded("", "invalid_encoding", i, 0)

@@ -1,8 +1,8 @@
 # abla-xml
 
-XML for Abla: a deterministic writer and a bounded, safe parser, with no dependencies
+XML for Abla: a deterministic writer, a bounded, safe parser and an XML Schema validator, with no dependencies
 beyond the standard library, and which read or write nothing but what they are given. It implements XML 1.0 (Fifth Edition) and
-Namespaces in XML 1.0, as a non-validating processor.
+Namespaces in XML 1.0, as a non-validating processor, and XML Schema 1.1 validation in part ([below](#xml-schema)).
 
 ```abla
 import github("AndreBaltazar8/abla-xml")
@@ -188,6 +188,108 @@ typical document with events only and 6 MB/s building a tree (about 18 MB/s from
 most namespace lookups the limits allow, took 17 s for 54 MB. Lower `maxBytes` where
 hostile input is expected.
 
+## XML Schema
+
+`import github("AndreBaltazar8/abla-xml/xsd")` validates documents against an XML Schema 1.1
+(and so 1.0) schema, assertions included, in one pass over the reader's events, so a document
+needn't fit in memory. Like the parser, it reads nothing it isn't given: a schema is one
+document, from bytes.
+
+```abla
+import github("AndreBaltazar8/abla-xml/xsd")
+import "abla/fs"
+import "abla/io"
+
+fun main: int {
+    val loaded = xsdLoad(path("saft.xsd").readText())
+    val schema = loaded.schema
+    if (schema == null) {
+        eprintln(loaded.error)      // not a schema, or something it uses isn't supported
+        return 2
+    }
+    val v = xsdValidateSource(schema, xmlFileSource(path("saft.xml")),
+        XsdOptions(XmlOptions(maxBytes = 1099511627776, maxNodes = 1099511627776)))
+    for (e in v.errors) eprintln("${e.path} (line ${e.elementLine}): ${e.code}: ${e.message}")
+    if (v.valid) 0 else 1
+}
+```
+
+| Call | Result |
+|---|---|
+| `xsdLoad(bytes, xmlOptions)` | an `XsdSchemaResult`: `succeeded`, `schema`, `error` |
+| `xsdValidate(schema, bytes, options)` | an `XsdValidation` of a document held in memory |
+| `xsdValidateSource(schema, source, options)` | the same, read from an `XmlSource` a piece at a time |
+| `xsdValidateReader(schema, reader, options)` | the same, from an `XmlReader` |
+
+`XsdValidation` has `valid`, `errors` (the first `maxErrors`), `errorCount` (all of them),
+`xmlError` when the document isn't well-formed or broke an `XmlOptions` limit, and `elements`.
+An `XsdError` has a `code` (`content`, `value`, `attribute`, `assertion`, `identity`,
+`unsupported`, `limit` or `xml`), a `message`, the `path` of the element the broken rule belongs
+to (`/AuditFile/MasterFiles/Customer`, without positions) and that element's `elementLine`, and
+the `line` and `column` where the problem itself was found. As other validators do, a child that
+doesn't fit belongs to its parent, and a reference to a missing key to the element that declares
+the constraint; a duplicate key belongs to the duplicate.
+
+### What is supported
+
+- Element declarations, global and local, by reference or with their own type; `minOccurs` and
+  `maxOccurs`; `form`, `elementFormDefault`, `attributeFormDefault`; `default` and `fixed`.
+- `xs:sequence` and `xs:choice`, nested, with any bounds; `xs:all`, with XSD 1.1's repeating
+  elements. Mixed content. Content models run as automata, so any bounds take linear time.
+- Complex types with attributes (`use`, `fixed`), and `xs:simpleContent` extending a simple type.
+- Simple types restricting a built-in or another simple type, with every facet: `length`,
+  `minLength`, `maxLength`, `pattern`, `enumeration`, `whiteSpace`, the four bounds,
+  `totalDigits` and `fractionDigits`. Values compare in their value space: decimals as exact
+  digits, never floats, and dates and times with XSD's partial order across time zones.
+- Built-in types: `string`, `normalizedString`, `token`, `language`, `Name`, `NCName`, `NMTOKEN`,
+  `boolean`, `decimal`, `integer` and all its restrictions (`long` to `unsignedByte`), `date`,
+  `dateTime`, `dateTimeStamp`, `time`, `gYear`, `gYearMonth`, `gMonthDay`, `gMonth`, `gDay`,
+  `anyURI`, `hexBinary`, `base64Binary`; `double`, `float` and `duration` by their lexical form
+  only, so a bound on them is refused.
+- Patterns in XSD's regular expressions, run by a Pike machine in time linear in the value:
+  classes, subtraction, `\s`, `\i`, `\c` and their complements, quantifiers with bounds.
+- `xs:unique`, `xs:key` and `xs:keyref` with XSD's selector and field paths (`.//`, `*`,
+  `prefix:*`, unions, attribute fields), comparing typed values (`1.0` equals `1`).
+- `xs:assert`, with this part of XPath 2.0, over the element's own typed tree (`..` from it is
+  empty, as XSD 1.1 says): `if then else`, `or`, `and`, the general (`=`, `!=`, `<`, ...) and value
+  (`eq`, `ne`, `lt`, ...) comparisons, string and decimal literals, paths of `.`, `..` and child
+  steps, and `not`, `true`, `false`, `exists`, `empty`, `boolean`, `count`. An error while
+  evaluating, such as `eq` on two values, makes the assertion false.
+- `vc:minVersion` and `vc:maxVersion`, as an XSD 1.1 processor reads them.
+
+### What is refused
+
+Everything else a schema can say is refused by `xsdLoad`, naming it, and never skipped: a
+schema that loads is checked in full. That includes `xs:import`, `xs:include`, `xs:redefine`,
+`xs:override`, wildcards (`xs:any`, `xs:anyAttribute`), `xs:anyType`, `xs:complexContent`,
+`xs:list`, `xs:union`, `xs:group`, `xs:attributeGroup`, substitution groups, abstract and
+nillable elements, type alternatives, open content, `QName`, `NOTATION`, `ID` and `IDREF`, the
+`assertion` and `explicitTimezone` facets, patterns with `\d`, `\w` or `\p{...}` (which need
+Unicode's tables), `xpathDefaultNamespace`, a keyref referring to a key on another element, and
+any XPath beyond the list above (predicates, arithmetic, `//`, attributes, other functions).
+In a document, `xsi:type` and `xsi:nil` are errors (`unsupported`); `xsi:schemaLocation` is
+ignored, as a hint.
+
+### Limits
+
+The document is read with its `XmlOptions`, so a DTD is refused unless asked for, entities are
+bounded, and so are size, depth and nodes. The validator holds the open elements, the typed tree
+of an element with assertions while it is open (`maxAssertionNodes`, 1,048,576), and the values
+of identity constraints (`maxIdentityEntries`, 16,777,216, over the document); past either it
+stops with a `limit` error. A keyref value found before its key is kept until the end of the
+constraint's element. A schema's patterns compile to at most 65,536 instructions and its content
+models to at most 1,048,576 states.
+
+On the development machine it validates a 126 MB SAF-T file in 7.4 s with a peak of 140 MB,
+of which reading takes 4.9 s.
+
+### Tested
+
+`make unit` runs tests/xsd_test.ab (each feature, each refusal and each limit, whole and read
+in pieces) and tests/xsd_regex_test.ab. abla-saft checks it against the official SAF-T (PT)
+schema, which needs XSD 1.1, on a corpus of files with one change each, against the verdicts and
+error places of xmlschema, an independent XSD 1.1 validator.
+
 ## Conformance
 
 `make conformance` downloads the [W3C XML conformance
@@ -250,8 +352,8 @@ Run them with `nix-shell ../ablac/shell.nix --run 'make all'`, adding `libxml2` 
 
 ## Not here
 
-Validation, XML Schema, XPath, XML 1.1, external entity loading, and writing a DOCTYPE or
-UTF-16. `xmlParse` needs memory for the whole tree; use `xmlChunkedReader` when that is too much.
+DTD validation, the parts of XML Schema listed as refused above, XPath outside assertions, XML 1.1,
+external entity loading, and writing a DOCTYPE or UTF-16. `xmlParse` needs memory for the whole tree; use `xmlChunkedReader` when that is too much.
 
 ## License
 

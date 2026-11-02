@@ -1,0 +1,77 @@
+import "../src/xsd/regex.ab"
+import "abla/test"
+
+fun yes(pattern: string, text: string): void {
+    val r = xsdRegexCompile(pattern)
+    expectEqual(r.error, "", "compiles [$pattern]")
+    expect(r.matches(text), "[$pattern] matches [$text]")
+    return
+}
+
+fun no(pattern: string, text: string): void {
+    val r = xsdRegexCompile(pattern)
+    expectEqual(r.error, "", "compiles [$pattern]")
+    expect(!r.matches(text), "[$pattern] doesn't match [$text]")
+    return
+}
+
+fun bad(pattern: string): void {
+    expect(xsdRegexCompile(pattern).error != "", "[$pattern] is refused")
+    return
+}
+
+fun main: int {
+    yes("1\\.04_01", "1.04_01")
+    no("1\\.04_01", "1x04_01")
+    yes("[^^]*", "")
+    yes("[^^]*", "abc def")
+    no("[^^]*", "a^b")
+    yes("[^ ]+ [^/^ ]+/[0-9]+", "FT A/1")
+    no("[^ ]+ [^/^ ]+/[0-9]+", "FT A/x")
+    no("[^ ]+ [^/^ ]+/[0-9]+", "FTA/1")
+    no("[^ ]+ [^/^ ]+/[0-9]+", "FT A^/1")
+    yes("([0-9]{9})+|([^^]+ [0-9/]+)", "123456789")
+    yes("([0-9]{9})+|([^^]+ [0-9/]+)", "123456789123456789")
+    no("([0-9]{9})+|([^^]+ [0-9/]+)", "12345678")
+    yes("([0-9]{9})+|([^^]+ [0-9/]+)", "Lisboa 12/3")
+    yes("(M[0-9]{2})+", "M07M16")
+    no("(M[0-9]{2})+", "M7")
+    yes("RED|INT|NOR|ISE|OUT|([a-zA-Z0-9\\.])*|NS", "")
+    yes("RED|INT|NOR|ISE|OUT|([a-zA-Z0-9\\.])*|NS", "a.1")
+    no("RED|INT|NOR|ISE|OUT|([a-zA-Z0-9\\.])*|NS", "a-1")
+    yes("[0-9]+|[0-9]+[\\.][0-9]+|[0-9]+-[A-Z]{2}(M )([^/^ ]+[/][0-9]+)|[0-9]+-[A-Z]{2}(D )([^ ]+ [^/^ ]+[/][0-9]+)", "1-FTM abc/00001")
+    yes("[0-9]+|[0-9]+[\\.][0-9]+|[0-9]+-[A-Z]{2}(M )([^/^ ]+[/][0-9]+)|[0-9]+-[A-Z]{2}(D )([^ ]+ [^/^ ]+[/][0-9]+)", "1-FTD XY 2013A/00099")
+    no("[0-9]+|[0-9]+[\\.][0-9]+|[0-9]+-[A-Z]{2}(M )([^/^ ]+[/][0-9]+)|[0-9]+-[A-Z]{2}(D )([^ ]+ [^/^ ]+[/][0-9]+)", "1-FTX abc/1")
+    yes("[1-9][0-9]{3}-[01][0-9]-[0-3][0-9] [^ ]{1,30} [^ ]{1,20}", "2026-01-31 J1 D5")
+    no("[^ ]{1,20}", "abcdefghijabcdefghijk")
+    yes("[^ ]{1,20}", "abcdefghijabcdefghij")
+    yes("[a-z-[aeiou]]+", "bcd")
+    no("[a-z-[aeiou]]+", "bad")
+    yes("[\\-a]", "-")
+    yes("[a-]", "-")
+    yes("a.c", "aéc")
+    no("a.c", "a\nc")
+    yes("\\i\\c*", "xs:name")
+    no("\\i\\c*", "1name")
+    yes("\\s?x", " x")
+    yes("^$", "^$")
+    yes("(a|b)*c{2,}", "ababcc")
+    no("(a|b)*c{2,}", "ababc")
+    yes("x{0}", "")
+    yes("(a*)*", "aaaa")
+    // Linear: many nested choices on a long value.
+    yes("(a|a)*(a|a)*b", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab")
+    no("(a|aa)*c", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaab")
+    bad("\\d")
+    bad("\\p{L}")
+    bad("\\w")
+    bad("[a")
+    bad("(a")
+    bad("a)")
+    bad("*a")
+    bad("a{2,1}")
+    bad("[z-a]")
+    bad("\\q")
+    bad("a{1,100}{1,100}{1,100}")
+    testsPassed()
+}
