@@ -770,7 +770,7 @@ class XsdLoader(
             fail(node, "assertion: ${compiled.error}")
             return
         }
-        schema.complexTypes[owner].assertions.append(XsdAssertion(test.value.trim(), compiled.expression, node.line))
+        schema.complexTypes[owner].assertions.append(XsdAssertion(xsdNormalizeWhitespace(test.value, xsdWhitespaceCollapse), compiled.expression, node.line))
         return
     }
 
