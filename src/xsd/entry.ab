@@ -1,7 +1,12 @@
-// XML Schema validation: `import github("AndreBaltazar8/abla-xml/xsd")`. See the README.
-import "../xml.ab"
-import "regex.ab"
-import "values.ab"
-import "xpath.ab"
-import "schema.ab"
-import "validate.ab"
+// XML Schema validation: `import github("AndreBaltazar8/abla-xml/xsd")`. See the README. It passes
+// on the parser's declarations too, which reading a document to validate needs.
+export import "../xml.ab"
+export import "../reader.ab"
+export import "../tree.ab"
+export import "../encoding.ab"
+export import "../file.ab"
+export import "regex.ab"
+export import "values.ab"
+export import "xpath.ab"
+export import "schema.ab"
+export import "validate.ab"
