@@ -7,14 +7,20 @@ CORPUS_DIR ?= $(BUILD_DIR)/corpus
 FUZZ_ITERATIONS ?= 200000
 FUZZ_SEED ?= 1
 
-.PHONY: test unit conformance written fuzz differential big all clean
+.PHONY: test unit conformance written fuzz differential wildcard-oracle big all clean
 
 all: unit conformance written fuzz
 
 test: unit
 
 unit:
-	$(COMPILER) test tests/writer_test.ab tests/reader_test.ab tests/roundtrip_test.ab tests/stream_test.ab tests/xsd_test.ab tests/xsd_regex_test.ab
+	$(COMPILER) test tests/writer_test.ab tests/reader_test.ab tests/roundtrip_test.ab tests/stream_test.ab tests/xsd_test.ab tests/xsd_regex_test.ab tests/xsd_wildcard_test.ab
+
+# Local, offline comparison with libxml2; needs xmllint on PATH.
+wildcard-oracle:
+	mkdir -p $(BUILD_DIR)
+	$(COMPILER) build tools/xsd-check.ab -o $(BUILD_DIR)/xsd-check
+	bash tools/xsd-wildcard-oracle.sh $(BUILD_DIR)/xsd-check $(BUILD_DIR)/wildcard-oracle
 
 conformance:
 	mkdir -p $(BUILD_DIR)

@@ -48,7 +48,7 @@ class XsdValidation(
 class XsdFrame(
     var namespace: string,
     var localName: string,
-    // The declaration, or -1 for an element that isn't validated (an error was reported).
+    // The declaration, or -1 for skipped/unknown lax content or a reported error.
     var decl: int,
     var typeKind: int,
     var typeIndex: int,
@@ -64,7 +64,10 @@ class XsdFrame(
     // The node in the assertion tree, or -1.
     var node: int,
     // Identity fields this element's value fills: pairs of selection and field.
-    val fills: array<int>
+    val fills: array<int>,
+    // An undeclared lax element still assesses declared descendants. A skip
+    // wildcard, unlike lax, suppresses assessment of its entire subtree.
+    var lax: bool = false
 )
 
 // An identity constraint in effect under an element: its node table, and keyref values
@@ -105,7 +108,9 @@ class XsdRun(
     var entries: int = 0,
     var elements: int = 0,
     var rootSeen: bool = false,
-    var stopped: bool = false
+    var stopped: bool = false,
+    // Keep the usual typed/no-assertion text path independent of element depth.
+    var untypedAssertions: int = 0
 ) {
     fun pathAt(depth: int): string {
         val out = byteBuffer()
@@ -203,6 +208,7 @@ class XsdRun(
         var decl = -1
         var parentNode = -1
         var undeclared = false
+        var lax = false
         if (depth == 0) {
             rootSeen = true
             val found = schema.globalElements.get("${event.namespaceUri} ${event.localName}")
@@ -212,6 +218,20 @@ class XsdRun(
             parentNode = frames[parent].node
             frames[parent].children = frames[parent].children + 1
             if (frames[parent].decl >= 0) decl = childDecl(schema, parent, event)
+            else if (frames[parent].lax) {
+                val found = schema.globalElements.get("${event.namespaceUri} ${event.localName}")
+                if (found == null) lax = true else decl = found
+            }
+        }
+        if (decl <= -2) {
+            val wildcard = schema.wildcards[-2 - decl]
+            decl = -1
+            if (wildcard.processing != 2) {
+                val found = schema.globalElements.get("${event.namespaceUri} ${event.localName}")
+                if (found != null) decl = found
+                else if (wildcard.processing == 0) undeclared = true
+                else lax = true
+            }
         }
         var typeKind = 0
         var typeIndex = -1
@@ -241,7 +261,7 @@ class XsdRun(
             }
         }
         var node = -1
-        if ((hasAssertions || parentNode >= 0) && decl >= 0) {
+        if (hasAssertions || parentNode >= 0) {
             if (tree.size >= options.maxAssertionNodes) {
                 report("limit", "an element with assertions holds more than ${options.maxAssertionNodes} elements", depth - 1, event.line, event.column)
                 stopped = true
@@ -252,6 +272,7 @@ class XsdRun(
         frames[depth].namespace = event.namespaceUri
         frames[depth].localName = event.localName
         frames[depth].decl = decl
+        frames[depth].lax = lax
         frames[depth].typeKind = typeKind
         frames[depth].typeIndex = typeIndex
         frames[depth].content = content
@@ -262,14 +283,28 @@ class XsdRun(
         frames[depth].line = event.line
         frames[depth].column = event.column
         frames[depth].node = node
+        if (node >= 0 && decl < 0) untypedAssertions = untypedAssertions + 1
         open = depth + 1
-        if (undeclared) report("content", "no global element declares ${event.localName}${if (event.namespaceUri != "") " in ${event.namespaceUri}" else " without a namespace"}", 0, event.line, event.column)
+        if (undeclared) report("content", "no global element declares ${event.localName}${if (event.namespaceUri != "") " in ${event.namespaceUri}" else " without a namespace"}", depth, event.line, event.column)
         if (decl >= 0) attributes(schema, depth, event)
+        else if (lax) {
+            for (a in event.attributes) if (a.namespaceUri == xsdInstanceNamespace && a.localName != "schemaLocation" && a.localName != "noNamespaceSchemaLocation") {
+                report("unsupported", "xsi:${a.localName} isn't supported", depth, event.line, event.column)
+            }
+        }
         identityStart(schema, depth, event)
         return
     }
 
-    // The declaration a child takes in its parent's content model, or -1 after reporting.
+    fun termMatches(schema: XsdSchema, term: int, event: XmlEvent): bool {
+        if (term >= 0) return schema.elements[term].name == event.localName && schema.elements[term].namespace == event.namespaceUri
+        xsdWildcardAllows(schema.wildcards[-2 - term], event.namespaceUri)
+    }
+
+    fun termName(schema: XsdSchema, term: int): string = if (term >= 0) schema.elements[term].name else "an element allowed by xs:any"
+
+    // The model label a child takes: a declaration, an encoded wildcard, or -1
+    // after reporting. The caller resolves a strict/lax wildcard globally.
     fun childDecl(schema: XsdSchema, parent: int, event: XmlEvent): int {
         val content = frames[parent].content
         if (content == xsdContentSimple || content == xsdContentEmpty) {
@@ -279,32 +314,55 @@ class XsdRun(
         val model = frames[parent].model
         if (model < 0) return -1
         if (schema.models[model].all) {
+            var selected = -1
             var i = 0
             while (i < schema.models[model].allDecls.size) {
                 val d = schema.models[model].allDecls[i]
-                if (schema.elements[d].name == event.localName && schema.elements[d].namespace == event.namespaceUri) {
-                    val count = frames[parent].counts[i] + 1
-                    frames[parent].counts[i] = count
-                    val max = schema.models[model].allMax[i]
-                    if (max >= 0 && count > max) {
-                        report("content", "${event.localName} occurs more than $max times in ${frames[parent].localName}", parent, event.line, event.column)
-                        return -1
-                    }
-                    return d
-                }
+                // XSD 1.1 gives an element particle precedence over a wildcard.
+                if (d >= 0 && termMatches(schema, d, event)) selected = i
                 i = i + 1
+            }
+            if (selected < 0) {
+                i = 0
+                while (i < schema.models[model].allDecls.size) {
+                    val d = schema.models[model].allDecls[i]
+                    if (d <= -2 && termMatches(schema, d, event)) {
+                        if (selected >= 0) {
+                            report("unsupported", "${event.localName} matches two wildcard particles (the schema isn't deterministic)", parent, event.line, event.column)
+                            return -1
+                        }
+                        selected = i
+                    }
+                    i = i + 1
+                }
+            }
+            if (selected >= 0) {
+                val count = frames[parent].counts[selected] + 1
+                frames[parent].counts[selected] = count
+                val max = schema.models[model].allMax[selected]
+                if (max >= 0 && count > max) {
+                    report("content", "${event.localName} occurs more than $max times in ${frames[parent].localName}", parent, event.line, event.column)
+                    return -1
+                }
+                return schema.models[model].allDecls[selected]
             }
             report("content", "unexpected element ${event.localName} in ${frames[parent].localName}", parent, event.line, event.column)
             return -1
         }
         scratch.clear()
         var decl = -1
+        var explicit = false
+        for (s in frames[parent].states) for (d in schema.models[model].edgeDecl[s]) if (d >= 0 && termMatches(schema, d, event)) explicit = true
         for (s in frames[parent].states) {
             var k = 0
             while (k < schema.models[model].edgeDecl[s].size) {
                 val d = schema.models[model].edgeDecl[s][k]
-                if (schema.elements[d].name == event.localName && schema.elements[d].namespace == event.namespaceUri) {
-                    if (decl >= 0 && decl != d && (schema.elements[d].typeKind != schema.elements[decl].typeKind || schema.elements[d].typeIndex != schema.elements[decl].typeIndex)) {
+                if ((!explicit || d >= 0) && termMatches(schema, d, event)) {
+                    if (decl != -1 && decl != d && (d < 0 || decl < 0)) {
+                        report("unsupported", "${event.localName} matches two wildcard particles (the schema isn't deterministic)", parent, event.line, event.column)
+                        return -1
+                    }
+                    if (decl >= 0 && d >= 0 && decl != d && (schema.elements[d].typeKind != schema.elements[decl].typeKind || schema.elements[d].typeIndex != schema.elements[decl].typeIndex)) {
                         report("unsupported", "${event.localName} matches two declarations of different types (the schema isn't deterministic)", parent, event.line, event.column)
                         return -1
                     }
@@ -318,7 +376,7 @@ class XsdRun(
                 k = k + 1
             }
         }
-        if (decl < 0) {
+        if (decl == -1) {
             report("content", "unexpected element ${event.localName} in ${frames[parent].localName}${expected(schema, model, frames[parent].states)}", parent, event.line, event.column)
             return -1
         }
@@ -332,7 +390,7 @@ class XsdRun(
         val names: array<string> = []
         for (s in states) {
             for (d in schema.models[model].edgeDecl[s]) {
-                val name = schema.elements[d].name
+                val name = termName(schema, d)
                 var seen = false
                 for (n in names) if (n == name) seen = true
                 if (!seen) names.append(name)
@@ -400,6 +458,20 @@ class XsdRun(
         if (open == 0) return
         val top = open - 1
         val content = frames[top].content
+        // An untyped element's value includes descendant text, in document
+        // order, even when a descendant has its own declaration under lax.
+        var ancestor = 0
+        while (untypedAssertions > 0 && ancestor <= top) {
+            if (frames[ancestor].decl < 0 && frames[ancestor].node >= 0) {
+                if (value.size > options.xml.maxValueBytes - frames[ancestor].text.size) {
+                    report("limit", "untyped assertion text exceeds maxValueBytes", ancestor, event.line, event.column)
+                    stopped = true
+                    return
+                }
+                frames[ancestor].text = frames[ancestor].text + value
+            }
+            ancestor = ancestor + 1
+        }
         if (frames[top].decl < 0) return
         var space = true
         for (c in value) if (!(c == 32 || c == 9 || c == 10 || c == 13)) { space = false; break }
@@ -442,7 +514,7 @@ class XsdRun(
                     if (any || !schema.models[model].allOptional) {
                         while (i < frames[depth].counts.size) {
                             if (frames[depth].counts[i] < schema.models[model].allMin[i]) {
-                                report("content", "${localName} is incomplete: it needs ${schema.elements[schema.models[model].allDecls[i]].name}", depth, line, column)
+                                report("content", "${localName} is incomplete: it needs ${termName(schema, schema.models[model].allDecls[i])}", depth, line, column)
                                 break
                             }
                             i = i + 1
@@ -493,6 +565,10 @@ class XsdRun(
                 }
             }
             if (node >= 0 && (depth == 0 || frames[depth - 1].node < 0)) tree.size = 0
+        } else if (node >= 0) {
+            tree.nodes[node].primitive = xsdPrimitiveUntyped
+            tree.nodes[node].text = text
+            untypedAssertions = untypedAssertions - 1
         }
         identityEnd(schema, depth, keyOk, keyPrimitive, keyValue, line, column)
         open = depth

@@ -58,6 +58,17 @@ class XsdAttributeUse(
 
 class XsdAssertion(val test: string, val expression: XsdExpr, val line: int)
 
+// Namespace variety: 0 any, 1 enumeration, 2 exclusion. Empty string is the
+// absent namespace. Processing: 0 strict, 1 lax, 2 skip.
+class XsdWildcard(val variety: int, val namespaces: array<string>, val processing: int)
+
+fun xsdWildcardAllows(wildcard: XsdWildcard, namespace: string): bool {
+    if (wildcard.variety == 0) return true
+    var listed = false
+    for (name in wildcard.namespaces) if (name == namespace) listed = true
+    if (wildcard.variety == 1) listed else !listed
+}
+
 class XsdComplexType(
     val name: string,
     val namespace: string,
@@ -101,7 +112,8 @@ class XsdIdentity(
 )
 
 // A content model. A sequence or choice is an automaton: states with moves that take an
-// element (`edgeDecl`, to `edgeTo`), and `closure`, what a state reaches without one. An
+// element (`edgeDecl`, to `edgeTo`), and `closure`, what a state reaches without one.
+// Negative edge labels encode wildcards as -2-index. An
 // xs:all keeps its elements' bounds instead.
 class XsdModel(
     val all: bool,
@@ -127,7 +139,9 @@ class XsdSchema(
     // Global elements by "namespace localName".
     val globalElements: Map<string, int>,
     // The local names identity selectors end in ("*" for any), so most elements skip them.
-    val selectorNames: Map<string, bool>
+    val selectorNames: Map<string, bool>,
+    // Model labels >=0 are element declarations; -2-index is a wildcard.
+    val wildcards: array<XsdWildcard> = []
 )
 
 // The most automaton states a schema's content models may expand to.
@@ -139,6 +153,7 @@ class XsdSchemaResult(val succeeded: bool, val schema: XsdSchema?, val error: st
 
 sealed interface XsdParticle
 class XsdParticleElement(val decl: int, val min: int, val max: int) : XsdParticle
+class XsdParticleWildcard(val wildcard: int, val min: int, val max: int) : XsdParticle
 // `kind` 0 sequence, 1 choice, 2 all.
 class XsdParticleGroup(val kind: int, val items: array<XsdParticle>, val min: int, val max: int) : XsdParticle
 
@@ -840,7 +855,7 @@ class XsdLoader(
                     items.append(group(doc, part, scope))
                 }
                 "all" -> fail(part, "xs:all can't be inside another group")
-                "any" -> unsupported(part, "xs:any (wildcards)")
+                "any" -> items.append(wildcardParticle(part))
                 "group" -> unsupported(part, "xs:group")
                 else -> fail(part, "xs:${part.localName} in xs:${node.localName}")
             }
@@ -871,6 +886,38 @@ class XsdLoader(
         XsdParticleElement(decl, min, max)
     }
 
+    fun wildcardParticle(node: XmlElement): XsdParticle {
+        attributesAllowed(node, ["id", "minOccurs", "maxOccurs", "namespace", "notNamespace", "processContents"])
+        for (child in children(node)) fail(child, "xs:${child.localName} in xs:any")
+        val min = occurs(node, "minOccurs", 1)
+        val max = occurs(node, "maxOccurs", 1)
+        if (max >= 0 && max < min) fail(node, "maxOccurs is below minOccurs")
+        val processing = xsdNormalizeWhitespace(node.attributeValue("processContents", "strict"), 2)
+        if (processing != "strict" && processing != "lax" && processing != "skip") fail(node, "invalid processContents '$processing'")
+        val excluded = node.attribute("notNamespace") != null
+        if (excluded && node.attribute("namespace") != null) fail(node, "namespace and notNamespace are mutually exclusive")
+        val raw = xsdNormalizeWhitespace(node.attributeValue(if (excluded) "notNamespace" else "namespace", if (excluded) "" else "##any"), 2)
+        var variety = if (excluded) 2 else 1
+        val namespaces: array<string> = []
+        if (!excluded && raw == "##any") variety = 0
+        else if (!excluded && raw == "##other") {
+            variety = 2
+            namespaces.append("")
+            if (schema.targetNamespace != "") namespaces.append(schema.targetNamespace)
+        } else {
+            for (name in raw.split(" ")) {
+                if (name == "") continue
+                if (name == "##local") namespaces.append("")
+                else if (name == "##targetNamespace") namespaces.append(schema.targetNamespace)
+                else if (name.startsWith("##")) fail(node, "invalid wildcard namespace token '$name'")
+                else namespaces.append(name)
+            }
+            if (excluded && namespaces.size == 0) fail(node, "notNamespace needs at least one namespace")
+        }
+        schema.wildcards.append(XsdWildcard(variety, namespaces, if (processing == "lax") 1 else if (processing == "skip") 2 else 0))
+        XsdParticleWildcard(schema.wildcards.size - 1, min, max)
+    }
+
     fun model(particle: XsdParticle, node: XmlElement): int {
         when (particle) {
             is XsdParticleGroup -> {
@@ -899,11 +946,16 @@ class XsdLoader(
             when (item) {
                 is XsdParticleElement -> {
                     for (d in decls) {
-                        if (schema.elements[d].name == schema.elements[item.decl].name && schema.elements[d].namespace == schema.elements[item.decl].namespace) {
+                        if (d >= 0 && schema.elements[d].name == schema.elements[item.decl].name && schema.elements[d].namespace == schema.elements[item.decl].namespace) {
                             fail(node, "xs:all names ${schema.elements[d].name} twice")
                         }
                     }
                     decls.append(item.decl)
+                    mins.append(item.min)
+                    maxes.append(item.max)
+                }
+                is XsdParticleWildcard -> {
+                    decls.append(-2 - item.wildcard)
                     mins.append(item.min)
                     maxes.append(item.max)
                 }
@@ -947,6 +999,10 @@ class XsdModelBuilder(
                 edgeDecl[from].append(particle.decl)
                 edgeTo[from].append(to)
             }
+            is XsdParticleWildcard -> {
+                edgeDecl[from].append(-2 - particle.wildcard)
+                edgeTo[from].append(to)
+            }
             is XsdParticleGroup -> {
                 if (particle.kind == 1) {
                     if (particle.items.size == 0) return
@@ -973,6 +1029,7 @@ class XsdModelBuilder(
         var max = 1
         when (particle) {
             is XsdParticleElement -> { min = particle.min; max = particle.max }
+            is XsdParticleWildcard -> { min = particle.min; max = particle.max }
             is XsdParticleGroup -> { min = particle.min; max = particle.max }
         }
         if (max == 0) {

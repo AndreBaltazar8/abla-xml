@@ -1,0 +1,15 @@
+// Offline verdict adapter for an independent-validator comparison.
+import "../src/xsd/entry.ab"
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+
+fun main: int {
+    if (processArgumentCount() != 2) return 2
+    val loaded = xsdLoad(path(processArgument(0)).readText())
+    val schema = loaded.schema
+    if (schema == null) { eprintln(loaded.error); return 2 }
+    val checked = xsdValidateSource(schema, xmlFileSource(path(processArgument(1))))
+    for (error in checked.errors) eprintln("${error.code} ${error.path}: ${error.message}")
+    if (checked.valid) 0 else 1
+}

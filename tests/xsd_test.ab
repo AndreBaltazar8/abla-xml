@@ -186,7 +186,6 @@ fun main: int {
     // Unsupported constructs are refused when the schema is loaded, never skipped.
     refused("<xs:import namespace=\"urn:x\"/>", "xs:import")
     refused("<xs:include schemaLocation=\"x.xsd\"/>", "xs:include")
-    refused("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:any/></xs:sequence></xs:complexType></xs:element>", "xs:any")
     refused("<xs:element name=\"r\"/>", "xs:anyType")
     refused("<xs:element name=\"r\" type=\"xs:anyType\"/>", "xs:anyType")
     refused("<xs:element name=\"r\" type=\"xs:QName\"/>", "xs:QName")

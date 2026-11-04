@@ -1,0 +1,99 @@
+import "../src/xsd/entry.ab"
+import "abla/test"
+import "abla/fs"
+
+val wildHead = "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:t=\"urn:t\" targetNamespace=\"urn:t\" elementFormDefault=\"qualified\">"
+fun wildSchema(body: string): XsdSchema? {
+    val loaded = xsdLoad("$wildHead$body</xs:schema>")
+    expect(loaded.succeeded, "wildcard schema loads: ${loaded.error}")
+    loaded.schema
+}
+fun wildBody(particle: string, assertions: string = ""): string = "<xs:element name=\"known\" type=\"xs:int\"/><xs:element name=\"r\"><xs:complexType><xs:sequence>$particle</xs:sequence>$assertions</xs:complexType></xs:element>"
+fun wildDoc(body: string): string = "<r xmlns=\"urn:t\">$body</r>"
+fun wildCheck(schema: XsdSchema?, document: string, ok: bool, label: string, code: string = ""): void {
+    if (schema == null) return
+    val whole = xsdValidate(schema, document)
+    expect(whole.valid == ok, "$label whole: ${if (whole.errors.size > 0) whole.errors[0].message else "no errors"}")
+    if (code != "" && whole.errors.size > 0) expectEqual(whole.errors[0].code, code, "$label error code")
+    for (piece in [1,7,64]) {
+        val streamed = xsdValidateSource(schema, xmlStringSource(document, piece))
+        expect(streamed.valid == ok && streamed.errorCount == whole.errorCount, "$label streamed in$piece-byte pieces")
+    }
+    return
+}
+fun wildRefused(attributes: string): void {
+    val loaded = xsdLoad("$wildHead${wildBody("<xs:any $attributes/>")}</xs:schema>")
+    expect(!loaded.succeeded, "invalid/unsupported wildcard refused: $attributes")
+    return
+}
+fun main: int {
+    val strict = wildSchema(wildBody("<xs:any maxOccurs=\"2\"/>"))
+    wildCheck(strict, wildDoc("<known>7</known>"), true, "default processing is strict")
+    wildCheck(strict, wildDoc("<unknown/>"), false, "strict needs a global declaration", "content")
+    wildCheck(strict, wildDoc("<known>bad</known>"), false, "strict validates declared values", "value")
+    wildCheck(strict, wildDoc("<known extra=\"x\">7</known>"), false, "strict validates declared attributes", "attribute")
+    wildCheck(strict, wildDoc(""), false, "wildcard minimum is one", "content")
+    wildCheck(strict, wildDoc("<known>1</known><known>2</known><known>3</known>"), false, "wildcard maximum is enforced", "content")
+    val lax = wildSchema(wildBody("<xs:any processContents=\"lax\" maxOccurs=\"unbounded\"/>"))
+    wildCheck(lax, wildDoc("<unknown a=\"x\"><nested/></unknown><known>7</known>"), true, "lax accepts unknown content and resumes declared siblings")
+    wildCheck(lax, wildDoc("<known>bad</known>"), false, "lax never skips a known declaration", "value")
+    wildCheck(lax, wildDoc("<unknown><known>bad</known></unknown>"), false, "lax assesses known descendants of unknown wrappers", "value")
+    val skip = wildSchema(wildBody("<xs:any processContents=\"skip\" maxOccurs=\"unbounded\"/>"))
+    wildCheck(skip, wildDoc("<known extra=\"x\">bad</known><unknown><known>bad</known></unknown>"), true, "skip suppresses declaration assessment throughout the subtree")
+    wildCheck(skip, wildDoc("<unknown></broken>"), false, "skip still requires well-formed XML", "xml")
+    for (mode in ["lax","skip"]) {
+        val other = wildSchema(wildBody("<xs:any namespace=\"##other\" processContents=\"$mode\"/>"))
+        wildCheck(other, wildDoc("<x xmlns=\"urn:foreign\"/>"), true, "##other admits a foreign namespace ($mode)")
+        wildCheck(other, wildDoc("<x/>"), false, "##other excludes the target namespace ($mode)", "content")
+        wildCheck(other, wildDoc("<x xmlns=\"\"/>"), false, "##other excludes absent namespace ($mode)", "content")
+    }
+    val listed = wildSchema(wildBody("<xs:any namespace=\"##local ##targetNamespace urn:extra\" processContents=\"skip\" maxOccurs=\"unbounded\"/>"))
+    wildCheck(listed, wildDoc("<x xmlns=\"\"/><x/><p:x xmlns:p=\"urn:extra\"/>"), true, "namespace lists compare expanded names, not prefixes")
+    wildCheck(listed, wildDoc("<x xmlns=\"urn:other\"/>"), false, "namespace lists reject other namespaces", "content")
+    val excluded = wildSchema(wildBody("<xs:any notNamespace=\"##local urn:banned\" processContents=\"skip\"/>"))
+    wildCheck(excluded, wildDoc("<x/>"), true, "notNamespace allows target namespace")
+    wildCheck(excluded, wildDoc("<x xmlns=\"urn:banned\"/>"), false, "notNamespace excludes listed URI", "content")
+    wildCheck(excluded, wildDoc("<x xmlns=\"\"/>"), false, "notNamespace excludes absent namespace", "content")
+    val noTarget = xsdLoad("<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\"><xs:element name=\"r\"><xs:complexType><xs:sequence><xs:any namespace=\"##targetNamespace\" processContents=\"skip\"/></xs:sequence></xs:complexType></xs:element></xs:schema>")
+    expect(noTarget.succeeded, "a wildcard works without a target namespace")
+    wildCheck(noTarget.schema, "<r><x/></r>", true, "##targetNamespace denotes absent when no target exists")
+    wildCheck(noTarget.schema, "<r><x xmlns=\"urn:t\"/></r>", false, "absent target isn't every namespace", "content")
+    val bounded = wildSchema(wildBody("<xs:any processContents=\"skip\" minOccurs=\"2\" maxOccurs=\"3\"/>"))
+    wildCheck(bounded, wildDoc("<a/><b/>"), true, "two wildcard occurrences")
+    wildCheck(bounded, wildDoc("<a/>"), false, "wildcard non-default minimum", "content")
+    val precedence = wildSchema("<xs:element name=\"known\" type=\"xs:int\"/><xs:element name=\"r\"><xs:complexType><xs:choice maxOccurs=\"unbounded\"><xs:any processContents=\"skip\"/><xs:element ref=\"t:known\"/></xs:choice></xs:complexType></xs:element>")
+    wildCheck(precedence, wildDoc("<unknown/><known>7</known>"), true, "element particle wins over wildcard")
+    wildCheck(precedence, wildDoc("<known>bad</known>"), false, "skip cannot swallow an explicit declaration", "value")
+    val all = wildSchema("<xs:element name=\"r\"><xs:complexType><xs:all><xs:element name=\"known\" type=\"xs:int\"/><xs:any namespace=\"##other\" processContents=\"skip\" maxOccurs=\"2\"/></xs:all></xs:complexType></xs:element>")
+    wildCheck(all, wildDoc("<x xmlns=\"urn:x\"/><known>7</known>"), true, "XSD1.1 all accepts wildcard in either order")
+    wildCheck(all, wildDoc("<known>7</known>"), false, "all retains wildcard minimum", "content")
+    val ambiguous = wildSchema("<xs:element name=\"r\"><xs:complexType><xs:choice><xs:any processContents=\"lax\"/><xs:any processContents=\"skip\"/></xs:choice></xs:complexType></xs:element>")
+    wildCheck(ambiguous, wildDoc("<unknown/>"), false, "ambiguous wildcards fail closed instead of choosing skip", "unsupported")
+    val keyed = wildSchema("<xs:element name=\"known\" type=\"xs:int\"/><xs:element name=\"r\"><xs:complexType><xs:sequence><xs:any maxOccurs=\"unbounded\"/></xs:sequence></xs:complexType><xs:key name=\"k\"><xs:selector xpath=\"t:known\"/><xs:field xpath=\".\"/></xs:key></xs:element>")
+    wildCheck(keyed, wildDoc("<known>1</known><known>2</known>"), true, "wildcard declarations retain typed identity constraints")
+    wildCheck(keyed, wildDoc("<known>1</known><known>01</known>"), false, "wildcard integer keys compare typed values", "identity")
+    val assertion = wildSchema(wildBody("<xs:any processContents=\"skip\" minOccurs=\"0\" maxOccurs=\"unbounded\"/>", "<xs:assert test=\"count(*) eq 2\"/>"))
+    wildCheck(assertion, wildDoc("<a/><b/>"), true, "parent assertion sees skipped children")
+    wildCheck(assertion, wildDoc("<a/>"), false, "wildcard doesn't hide children from assertions", "assertion")
+    val stringValue = wildSchema(wildBody("<xs:any processContents=\"skip\"/>", "<xs:assert test=\"t:unknown = 'beforeinsideafter'\"/>"))
+    wildCheck(stringValue, wildDoc("<unknown>before<child>inside</child>after</unknown>"), true, "untyped assertion value includes descendant text in order")
+    wildCheck(stringValue, wildDoc("<unknown>before<child>wrong</child>after</unknown>"), false, "descendant text cannot disappear from the assertion value", "assertion")
+    if (assertion != null) {
+        val limited = xsdValidate(assertion, wildDoc("<a><nested/></a><b/>"), XsdOptions(maxAssertionNodes=2))
+        expect(!limited.valid && limited.errors.size > 0 && limited.errors[0].code == "limit", "wildcard assertion trees retain their node bound")
+        val textLimited = xsdValidate(assertion, wildDoc("<a>abc<![CDATA[def]]>ghi</a><b/>"), XsdOptions(XmlOptions(maxValueBytes=8)))
+        expect(!textLimited.valid && textLimited.errors.size > 0 && textLimited.errors[0].code == "limit", "untyped assertion values retain a bound across text events")
+    }
+    for (attrs in ["processContents=\"ignore\"", "namespace=\"##any urn:x\"", "namespace=\"##other ##local\"", "namespace=\"##unknown\"", "namespace=\"##any\" notNamespace=\"urn:x\"", "notNamespace=\"\"", "notQName=\"t:known\"", "minOccurs=\"2\" maxOccurs=\"1\""]) wildRefused(attrs)
+    val full = xsdLoad(path("tests/fixtures/pain.001.001.09.xsd").readText())
+    expect(full.succeeded, "unchanged complete ISO V09 schema loads: ${full.error}")
+    val payment = path("tests/fixtures/pain09.xml").readText()
+    wildCheck(full.schema, payment, true, "V09 payment without supplementary data")
+    val extra = payment.replace("</CstmrCdtTrfInitn>", "<SplmtryData><Envlp><x:proof xmlns:x=\"urn:example:proof\"><x:value>synthetic</x:value></x:proof></Envlp></SplmtryData></CstmrCdtTrfInitn>")
+    wildCheck(full.schema, extra, true, "V09 unknown lax supplementary envelope")
+    wildCheck(full.schema, extra.replace("<x:proof xmlns:x=\"urn:example:proof\"><x:value>synthetic</x:value></x:proof>", ""), false, "V09 supplementary envelope requires one element", "content")
+    wildCheck(full.schema, extra.replace("</x:proof>", "</x:proof><x:second xmlns:x=\"urn:example:proof\"/>"), false, "V09 envelope permits only one wildcard child", "content")
+    wildCheck(full.schema, extra.replace("<x:proof xmlns:x=\"urn:example:proof\"><x:value>synthetic</x:value></x:proof>", "<Document/>"), false, "V09 lax envelope validates a known global declaration", "content")
+    wildCheck(full.schema, payment.replace("<InstdAmt Ccy=\"EUR\">12.34", "<InstdAmt Ccy=\"EUR\">bad"), false, "V09 keeps ordinary amount validation", "value")
+    testsPassed()
+}

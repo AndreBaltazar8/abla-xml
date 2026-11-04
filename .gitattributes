@@ -1,0 +1,2 @@
+# Preserve the official schema's exact CRLF bytes and checksum.
+tests/fixtures/pain.001.001.09.xsd -text whitespace=cr-at-eol

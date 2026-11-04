@@ -236,6 +236,14 @@ the constraint; a duplicate key belongs to the duplicate.
   `maxOccurs`; `form`, `elementFormDefault`, `attributeFormDefault`; `default` and `fixed`.
 - `xs:sequence` and `xs:choice`, nested, with any bounds; `xs:all`, with XSD 1.1's repeating
   elements. Mixed content. Content models run as automata, so any bounds take linear time.
+- `xs:any` particles in those groups, with occurrence bounds and `processContents`
+  `strict` (the default), `lax`, or `skip`. Strict needs a global declaration; lax
+  validates declarations it finds, including declared descendants of an unknown
+  wrapper; skip leaves the whole subtree unassessed. XML well-formedness and reader
+  limits always apply. Parent assertions still see untyped wildcard content.
+  Namespace constraints support `##any`, `##other` (excluding the target and absent
+  namespaces), URI lists with `##local`/`##targetNamespace`, and XSD 1.1
+  `notNamespace`. No schema or namespace URI is fetched.
 - Complex types with attributes (`use`, `fixed`), and `xs:simpleContent` extending a simple type.
 - Simple types restricting a built-in or another simple type, with every facet: `length`,
   `minLength`, `maxLength`, `pattern`, `enumeration`, `whiteSpace`, the four bounds,
@@ -261,14 +269,17 @@ the constraint; a duplicate key belongs to the duplicate.
 
 Everything else a schema can say is refused by `xsdLoad`, naming it, and never skipped: a
 schema that loads is checked in full. That includes `xs:import`, `xs:include`, `xs:redefine`,
-`xs:override`, wildcards (`xs:any`, `xs:anyAttribute`), `xs:anyType`, `xs:complexContent`,
+`xs:override`, `xs:anyAttribute`, wildcard `notQName` exclusions, `xs:anyType`, `xs:complexContent`,
 `xs:list`, `xs:union`, `xs:group`, `xs:attributeGroup`, substitution groups, abstract and
 nillable elements, type alternatives, open content, `QName`, `NOTATION`, `ID` and `IDREF`, the
 `assertion` and `explicitTimezone` facets, patterns with `\d`, `\w` or `\p{...}` (which need
 Unicode's tables), `xpathDefaultNamespace`, a keyref referring to a key on another element, and
 any XPath beyond the list above (predicates, arithmetic, `//`, attributes, other functions).
-In a document, `xsi:type` and `xsi:nil` are errors (`unsupported`); `xsi:schemaLocation` is
-ignored, as a hint.
+In assessed content, `xsi:type` and `xsi:nil` are errors (`unsupported`);
+`xsi:schemaLocation` is ignored, as a hint. A skip wildcard does not assess those
+attributes. Explicit element particles take precedence over wildcards, as in XSD
+1.1; two distinct matching wildcards fail with a determinism error (`unsupported`)
+instead of selecting weaker validation.
 
 ### Limits
 
@@ -286,7 +297,12 @@ of which reading takes 4.9 s.
 ### Tested
 
 `make unit` runs tests/xsd_test.ab (each feature, each refusal and each limit, whole and read
-in pieces) and tests/xsd_regex_test.ab. abla-saft checks it against the official SAF-T (PT)
+in pieces), tests/xsd_regex_test.ab and tests/xsd_wildcard_test.ab. The wildcard tests
+load the unchanged ISO pain.001.001.09 schema, with and without supplementary data,
+and keep ordinary invalid payments invalid. `make wildcard-oracle` compares offline
+verdicts with libxml2 (`xmllint --nonet`), checking the schema's checksum first.
+Wildcard semantics follow [XSD 1.1 section3.10](https://www.w3.org/TR/xmlschema11-1/#Wildcards).
+abla-saft checks it against the official SAF-T (PT)
 schema, which needs XSD 1.1, on a corpus of files with one change each, against the verdicts and
 error places of xmlschema, an independent XSD 1.1 validator.
 
