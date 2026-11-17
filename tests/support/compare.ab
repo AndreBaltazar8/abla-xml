@@ -2,6 +2,8 @@
 // must give the same events, split however it is.
 import "../../src/xml.ab"
 import "abla/bytes"
+import "../../src/reader.ab"
+import "../../src/encoding.ab"
 
 fun describeEvent(event: XmlEvent): string {
     val out = byteBuffer()

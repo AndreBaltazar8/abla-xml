@@ -17,6 +17,10 @@ import "abla/fs"
 import "abla/io"
 import "abla/process"
 import "abla/text"
+import "../src/reader.ab"
+import "../src/parse.ab"
+import "../src/writer.ab"
+import "../src/tree.ab"
 
 class Stats(var accepted: int = 0, var rejected: int = 0, var rewrites: int = 0, val codes: Map<string, int>)
 

@@ -5,6 +5,7 @@ import "abla/fs"
 import "abla/io"
 import "abla/process"
 import "abla/text"
+import "../src/reader.ab"
 
 fun main: int {
     val options = [XmlOptions(), XmlOptions(allowDtd = true), XmlOptions(allowDtd = true, namespaces = false)]

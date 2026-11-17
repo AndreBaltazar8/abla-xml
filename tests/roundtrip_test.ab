@@ -2,6 +2,9 @@
 import "../src/xml.ab"
 import "support/generate.ab"
 import "abla/test"
+import "../src/parse.ab"
+import "../src/writer.ab"
+import "../src/tree.ab"
 
 fun main: int {
     var seed = 1

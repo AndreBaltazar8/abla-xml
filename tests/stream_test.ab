@@ -9,6 +9,12 @@ import "abla/fs"
 import "abla/memory"
 import "abla/test"
 import "abla/text"
+import "../src/writer.ab"
+import "../src/file.ab"
+import "../src/reader.ab"
+import "../src/parse.ab"
+import "../src/tree.ab"
+import "../src/encoding.ab"
 
 class Collect(val parts: ByteBuffer, var writes: int = 0, var biggest: int = 0, var closes: int = 0) : XmlSink {
     fun write(bytes: string): bool {

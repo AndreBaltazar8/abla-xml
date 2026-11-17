@@ -10,6 +10,9 @@ import "abla/io"
 import "abla/process"
 import "abla/text"
 import "abla/bytes"
+import "../src/tree.ab"
+import "../src/reader.ab"
+import "../src/parse.ab"
 
 class Tally(
     var total: int = 0,

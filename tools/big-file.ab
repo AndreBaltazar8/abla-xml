@@ -6,6 +6,9 @@ import "../src/xml.ab"
 import "abla/fs"
 import "abla/io"
 import "abla/process"
+import "../src/writer.ab"
+import "../src/file.ab"
+import "../src/reader.ab"
 
 fun parseCount(text: string): int {
     var value = 0

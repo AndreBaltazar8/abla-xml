@@ -1,6 +1,7 @@
 import "../src/xsd/entry.ab"
 import "abla/test"
 import "abla/fs"
+import "abla/text"
 
 val wildHead = "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:t=\"urn:t\" targetNamespace=\"urn:t\" elementFormDefault=\"qualified\">"
 fun wildSchema(body: string): XsdSchema? {
