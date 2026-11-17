@@ -344,9 +344,9 @@ What the numbers mean:
 
 - `make unit`: writer and parser unit tests; a property test of 2000 generated documents
   that must read back to what the generator recorded, and rewrite stably.
-- `make written`: the same 2000 documents through `xmllint`, and through expat
-  (`tools/check-written.py`), which must see exactly the events the generator recorded,
-  in each of the four encodings.
+- `make written`: the same 2000 documents through `xmllint`, which must accept them, and then (`tools/check-written.sh`)
+  libxml2 re-serializes each one as UTF-8 and this library must read from that exactly the events the generator
+  recorded, in each of the four encodings. (This used to run Python's expat; no Python is needed any more.)
 - `make fuzz`: repeatable mutational fuzzing from built-in seeds and the suite's small
   files. Each input is parsed under four sets of options; no panic, errors have sane
   positions, and what parses must write and reparse to the same meaning. CI runs 200,000
@@ -364,7 +364,7 @@ What the numbers mean:
   a pass/fail check.
 
 Run them with `nix-shell ../ablac/shell.nix --run 'make all'`, adding `libxml2` and
-`python3` for `written`.
+for `written`.
 
 ## Not here
 

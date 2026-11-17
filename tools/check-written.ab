@@ -1,0 +1,41 @@
+// Checks write-corpus output against libxml2: tools/check-written.sh has had xmllint read each document and write its
+// canonical form (C14N) beside it, in UTF-8 whatever the document's own encoding, with libxml2's reading of every entity,
+// character reference and CDATA section applied. Each canonical form must parse, with this library, to exactly the
+// events the generator recorded for the document.
+//
+//   check-written <file listing the .expected files, one per line>
+import "../src/xml.ab"
+import "../src/parse.ab"
+import "../tests/support/generate.ab"
+import "abla/fs"
+import "abla/io"
+import "abla/process"
+import "abla/text"
+
+fun main: int {
+    var documents = 0
+    var failures = 0
+    for (expectedPath in Path(processArgument(0)).readText().split("\n")) {
+        if (expectedPath.size > 0) {
+            documents = documents + 1
+            val canonical = Path("${expectedPath.slice(0, expectedPath.size - 9)}.c14n")
+            val canonicalResult = canonical.readTextResult()
+            if (!canonicalResult.succeeded) {
+                println("${expectedPath}: libxml2 rejects the document (no canonical form)")
+                failures = failures + 1
+            } else {
+                val parsed = xmlParse(canonicalResult.text)
+                val document = parsed.document
+                if (parsed.error != null || document == null) {
+                    println("${expectedPath}: this library cannot read libxml2's canonical form of it")
+                    failures = failures + 1
+                } else if (describeTree(document.root) != Path(expectedPath).readText()) {
+                    println("${expectedPath}: means something else to libxml2")
+                    failures = failures + 1
+                }
+            }
+        }
+    }
+    println("libxml2: $documents documents, $failures failures")
+    if (failures > 0) 1 else 0
+}

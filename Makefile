@@ -31,14 +31,15 @@ conformance:
 	find $(SUITE_DIR)/xmlconf -type f -size -1024k > $(BUILD_DIR)/stream-files.txt
 	$(BUILD_DIR)/stream-compare $(BUILD_DIR)/stream-files.txt
 
-# Written documents against xmllint and expat; needs both on the PATH.
+# Written documents against xmllint (libxml2); needs it on the PATH.
 written:
 	mkdir -p $(BUILD_DIR)
 	$(COMPILER) build tools/write-corpus.ab -o $(BUILD_DIR)/write-corpus
 	rm -rf $(CORPUS_DIR)
 	$(BUILD_DIR)/write-corpus $(CORPUS_DIR) 2000
 	cd $(CORPUS_DIR) && find . -name '*.xml' -print0 | xargs -0 -n 200 xmllint --noout --nonet
-	python3 -I tools/check-written.py $(CORPUS_DIR)
+	$(COMPILER) build tools/check-written.ab -o $(BUILD_DIR)/check-written
+	bash tools/check-written.sh $(BUILD_DIR)/check-written $(CORPUS_DIR)
 
 fuzz:
 	mkdir -p $(BUILD_DIR)
@@ -55,7 +56,7 @@ differential:
 	find $(SUITE_DIR)/xmlconf -name '*.xml' -size -16k > $(BUILD_DIR)/fuzz-seeds.txt
 	rm -rf $(BUILD_DIR)/fuzz-dump
 	$(BUILD_DIR)/fuzz 100000 $(FUZZ_SEED) $(BUILD_DIR)/fuzz-seeds.txt $(BUILD_DIR)/fuzz-dump
-	python3 -I tools/compare-xmllint.py $(BUILD_DIR)/fuzz-dump
+	bash tools/compare-xmllint.sh $(BUILD_DIR)/fuzz-dump
 
 # At least 3 GiB through files, with peak memory. Local only; needs xmllint and GNU time.
 BIG_DIR ?= /tmp

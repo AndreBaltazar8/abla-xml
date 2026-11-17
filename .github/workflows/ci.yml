@@ -21,7 +21,7 @@ jobs:
         run: make unit COMPILER=ablac
       - name: W3C conformance suite
         run: make conformance COMPILER=ablac
-      - name: Written documents against xmllint and expat
+      - name: Written documents against xmllint
         run: make written COMPILER=ablac
       - name: Fuzzing
         run: make fuzz COMPILER=ablac
