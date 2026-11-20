@@ -3,7 +3,6 @@
 // No floating point: decimals are compared as digits.
 import "abla/text"
 import "abla/bytes"
-import "../chars.ab"
 
 // Primitive types, and the families comparisons go by.
 val xsdPrimitiveAny = 0

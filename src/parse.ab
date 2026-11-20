@@ -1,5 +1,4 @@
 // Builds a tree from the reader's events.
-import "abla/bytes"
 import "reader.ab"
 import "tree.ab"
 
