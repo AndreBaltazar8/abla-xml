@@ -27,7 +27,7 @@ fun xmlParse(source: string, options: XmlOptions = XmlOptions()): XmlParseResult
         if (kind == xmlEventEndOfDocument) break
         if (kind == xmlEventStart) {
             val element = XmlElement(event.name, event.prefix, event.localName, event.namespaceUri,
-                event.attributes, [], event.byteOffset, event.line, event.column)
+                event.attributes, [], event.byteOffset, event.line, event.column, options.namespaces)
             if (open.size > 0) {
                 open[open.size - 1].children.append(element)
             } else {

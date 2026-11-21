@@ -34,7 +34,8 @@ class XmlElement(
     val children: array<XmlNode>,
     val byteOffset: int,
     val line: int,
-    val column: int
+    val column: int,
+    val namespacesResolved: bool = false
 ) : XmlNode {
     // The attribute with this local name, or null.
     fun attribute(localName: string, namespaceUri: string = ""): XmlAttribute? {
@@ -140,6 +141,19 @@ fun xmlWriteNode(var writer: XmlWriter, node: XmlNode): void {
     return
 }
 
+// Restore bindings inherited at the element's original location. A binding
+// already declared on this tag cannot be changed without changing its meaning.
+private fun xmlCloseTreePrefix(var writer: XmlWriter, prefix: string, uri: string): void {
+    if (writer.failed() || writer.prefixUri(prefix) == uri) return
+    val binding = writer.findPrefix(prefix)
+    if (binding >= writer.nsMarks[writer.nsMarks.size - 1] || prefix == "xml") {
+        writer.fail("namespace_conflict", "conflicting namespace for prefix '$prefix'")
+    } else {
+        writer.namespace(prefix, uri)
+    }
+    return
+}
+
 // Writes an element and everything in it, in order.
 fun xmlWriteElement(var writer: XmlWriter, element: XmlElement): void {
     writer.startElement(element.name)
@@ -150,6 +164,30 @@ fun xmlWriteElement(var writer: XmlWriter, element: XmlElement): void {
             writer.namespace(attribute.localName, attribute.value)
         } else {
             writer.attribute(attribute.name, attribute.value)
+        }
+    }
+    if (element.namespacesResolved && !writer.failed()) {
+        val prefix = xmlPrefixOf(element.name)
+        xmlCloseTreePrefix(writer, prefix, element.namespaceUri)
+        for (attribute in element.attributes) {
+            val attributePrefix = xmlPrefixOf(attribute.name)
+            if (attributePrefix != "" && attributePrefix != "xmlns") {
+                xmlCloseTreePrefix(writer, attributePrefix, attribute.namespaceUri)
+            }
+        }
+        // A later attribute can introduce a binding that an earlier name
+        // inherited. Check all expanded names against the completed tag.
+        if (writer.prefixUri(prefix) != element.namespaceUri) {
+            writer.fail("namespace_conflict", "conflicting namespace for ${element.name}")
+        }
+        for (attribute in element.attributes) {
+            val attributePrefix = xmlPrefixOf(attribute.name)
+            if (attribute.name != "xmlns" && attributePrefix != "xmlns") {
+                val uri = if (attributePrefix == "") "" else writer.prefixUri(attributePrefix)
+                if (uri != attribute.namespaceUri) {
+                    writer.fail("namespace_conflict", "conflicting namespace for ${attribute.name}")
+                }
+            }
         }
     }
     for (node in element.children) xmlWriteNode(writer, node)

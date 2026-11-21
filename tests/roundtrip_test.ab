@@ -6,7 +6,53 @@ import "../src/parse.ab"
 import "../src/writer.ab"
 import "../src/tree.ab"
 
+private fun checkNamespaceClosure(): void {
+    val original = xmlParse("<outer xmlns='urn:original' xmlns:p='urn:attr'><child p:id='1' id='2'><none xmlns=''/></child></outer>").document
+    val detached = if (original != null) original.root.child("child") else null
+    if (detached == null) {
+        expect(false, "fixture has a detached subtree")
+        return
+    }
+    val output = xmlWriter()
+    output.startElement("host")
+    output.namespace("", "urn:host")
+    output.namespace("p", "urn:other")
+    xmlWriteElement(output, detached)
+    output.endElement()
+    val result = output.finish()
+    expect(result.succeeded, "detached subtree can be written")
+    val reopened = xmlParse(result.text).document
+    val child = if (reopened != null) reopened.root.child("child", "urn:original") else null
+    if (child == null) {
+        expect(false, "detached subtree kept its original namespace")
+        return
+    }
+    expectEqual(child.attributeValue("id", "", "urn:attr"), "1", "inherited attribute prefix is restored")
+    expectEqual(child.attributeValue("id"), "2", "unprefixed attribute stays outside the default namespace")
+    expect(child.child("none", "") != null, "explicit default reset is preserved")
+    val plain = xmlParse("<plain/>").document
+    if (plain != null) {
+        val underDefault = xmlWriter()
+        underDefault.startElement("host")
+        underDefault.namespace("", "urn:host")
+        xmlWriteElement(underDefault, plain.root)
+        underDefault.endElement()
+        expectEqual(underDefault.finish().text, "<host xmlns=\"urn:host\"><plain xmlns=\"\"/></host>", "standalone no-namespace node resets the host default")
+    }
+    val raw = xmlParse("<plain/>", XmlOptions(namespaces = false)).document
+    if (raw != null) {
+        val legacy = xmlWriter()
+        legacy.startElement("host")
+        legacy.namespace("", "urn:host")
+        xmlWriteElement(legacy, raw.root)
+        legacy.endElement()
+        expectEqual(legacy.finish().text, "<host xmlns=\"urn:host\"><plain/></host>", "raw namespace mode retains legacy behavior")
+    }
+    return
+}
+
 fun main: int {
+    checkNamespaceClosure()
     var seed = 1
     while (seed <= 2000) {
         val generated = generateDocument(seed)
