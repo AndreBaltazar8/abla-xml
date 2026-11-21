@@ -17,7 +17,7 @@ fun xmlWriteNode(var writer: XmlWriter, node: XmlNode): void {
 
 // Restore bindings inherited at the element's original location. A binding
 // already declared on this tag cannot be changed without changing its meaning.
-private fun xmlCloseTreePrefix(var writer: XmlWriter, prefix: string, uri: string): void {
+fun xmlCloseTreePrefix(var writer: XmlWriter, prefix: string, uri: string): void {
     if (writer.failed() || writer.prefixUri(prefix) == uri) return
     val binding = writer.findPrefix(prefix)
     if (binding >= writer.nsMarks[writer.nsMarks.size - 1] || prefix == "xml") {
@@ -25,6 +25,21 @@ private fun xmlCloseTreePrefix(var writer: XmlWriter, prefix: string, uri: strin
     } else {
         writer.namespace(prefix, uri)
     }
+    return
+}
+
+// A resolved tree can only preserve the meaning of a node with known bindings.
+fun xmlWriteResolvedNode(var writer: XmlWriter, node: XmlNode): void {
+    when (node) {
+        is XmlElement -> {
+            if (!node.namespacesResolved) {
+                writer.fail("unresolved_namespace", "XML literal needs a namespace-aware node")
+                return
+            }
+        }
+        else -> {}
+    }
+    xmlWriteNode(writer, node)
     return
 }
 
@@ -64,7 +79,10 @@ fun xmlWriteElement(var writer: XmlWriter, element: XmlElement): void {
             }
         }
     }
-    for (node in element.children) xmlWriteNode(writer, node)
+    for (node in element.children) {
+        if (element.namespacesResolved) xmlWriteResolvedNode(writer, node)
+        else xmlWriteNode(writer, node)
+    }
     writer.endElement()
     return
 }

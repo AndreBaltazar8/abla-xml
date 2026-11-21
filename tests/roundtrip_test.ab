@@ -51,7 +51,53 @@ private fun checkNamespaceClosure(): void {
     return
 }
 
+class XmlLiteralWriterHolder(val xml: XmlWriter)
+
+private fun checkLiteralWriters(): void {
+    val value = "<&\"\t\n\r"
+    val nested = $xml <p:node xmlns:p="urn:n" p:attr={value}/>
+    val tree = $xml <r xmlns="urn:r" a={value}><data>{value}</data>{node nested}</r>
+    val viaTree = xmlWriter()
+    xmlWriteElement(viaTree, tree)
+    val expected = viaTree.finish()
+    expect(expected.succeeded, "literal tree writes")
+    val holder = XmlLiteralWriterHolder(xmlWriter())
+    val actual = $xmlw(holder.xml) <r xmlns="urn:r" a={value}><data>{value}</data>{node nested}</r>
+    val streamed = actual.finish()
+    expect(streamed.succeeded, "literal writer writes into a field")
+    expectEqual(streamed.text, expected.text, "literal writer matches literal tree")
+    val parsed = xmlParse(streamed.text).document
+    if (parsed != null) {
+        expectEqual(parsed.root.attributeValue("a"), value, "dynamic attribute survives write and parse")
+        expectEqual(parsed.root.childText("data", "urn:r"), value, "dynamic text survives write and parse")
+    } else {
+        expect(false, "written XML parses")
+    }
+    val host = xmlWriter()
+    host.startElement("host")
+    host.namespace("", "urn:host")
+    $xmlw(host) <plain/>
+    host.endElement()
+    expectEqual(host.finish().text, "<host xmlns=\"urn:host\"><plain xmlns=\"\"/></host>", "streaming preserves empty expanded namespace")
+    val fresh = $xmlw(xmlWriter()) <r/>
+    expectEqual(fresh.finish().text, "<r/>", "fresh writer works")
+    val raw = xmlParse("<raw/>", XmlOptions(namespaces = false)).document
+    if (raw != null) {
+        val rawNode = raw.root
+        val assembled = $xml <r>{node rawNode}</r>
+        val rejectedTree = xmlWriter()
+        xmlWriteElement(rejectedTree, assembled)
+        expectEqual(rejectedTree.finish().errorCode, "unresolved_namespace", "literal tree refuses raw node")
+        val rejectedStream = $xmlw(xmlWriter()) <r>{node rawNode}</r>
+        expectEqual(rejectedStream.finish().errorCode, "unresolved_namespace", "literal stream refuses raw node")
+    } else {
+        expect(false, "raw node fixture parses")
+    }
+    return
+}
+
 fun main: int {
+    checkLiteralWriters()
     checkNamespaceClosure()
     var seed = 1
     while (seed <= 2000) {

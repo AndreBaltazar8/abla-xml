@@ -1,0 +1,26 @@
+// Runtime writer adapter for the standard-library XML subparser.
+export import "abla/xml/write"
+import "tree.ab"
+import "writer.ab"
+
+fun ablaXmlWriteLiteralStart(var writer: XmlWriter, name: string): void = writer.startElement(name)
+fun ablaXmlWriteLiteralEnd(var writer: XmlWriter): void = writer.endElement()
+fun ablaXmlWriteLiteralNamespace(var writer: XmlWriter, prefix: string, uri: string): void =
+    writer.namespace(prefix, uri)
+fun ablaXmlWriteLiteralAttribute(var writer: XmlWriter, name: string, value: string): void =
+    writer.attribute(name, value)
+fun ablaXmlWriteLiteralBinding(var writer: XmlWriter, prefix: string, uri: string): void =
+    xmlCloseTreePrefix(writer, prefix, uri)
+fun ablaXmlWriteLiteralText(var writer: XmlWriter, text: string): void = writer.text(text)
+fun ablaXmlWriteLiteralCdata(var writer: XmlWriter, text: string): void = writer.cdata(text)
+fun ablaXmlWriteLiteralComment(var writer: XmlWriter, text: string): void = writer.comment(text)
+fun ablaXmlWriteLiteralInstruction(var writer: XmlWriter, name: string, data: string): void =
+    writer.processingInstruction(name, data)
+
+fun ablaXmlWriteLiteralNode(var writer: XmlWriter, node: XmlNode): void =
+    xmlWriteResolvedNode(writer, node)
+
+fun ablaXmlWriteLiteralNodes(var writer: XmlWriter, nodes: array<XmlNode>): void {
+    for (node in nodes) ablaXmlWriteLiteralNode(writer, node)
+    return
+}
