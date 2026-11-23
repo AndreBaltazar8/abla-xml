@@ -315,6 +315,17 @@ fun main: int {
         expect(!notted.succeeded && notted.error.contains("nests deeper"), "20,000 nested not() are refused, not a stack overflow: ${notted.error}")
         val iffed = xsdLoad("$head<xs:element name=\"r\"><xs:complexType><xs:sequence/><xs:assert test=\"${"if (true()) then ".repeat(20000)}true()${" else false()".repeat(20000)}\"/></xs:complexType></xs:element></xs:schema>")
         expect(!iffed.succeeded && iffed.error.contains("nests deeper"), "20,000 nested if-then-else are refused: ${iffed.error}")
+        // An or / and chain is evaluated with a stack of its own: 200,000 operands overflowed the call stack. The order and the short cuts are the nested form's.
+        val chain = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"a\" type=\"xs:string\" minOccurs=\"0\"/></xs:sequence><xs:assert test=\"${"t:a = 'x' or ".repeat(200000)}t:a = 'y'\"/></xs:complexType></xs:element>")
+        valid(chain, "<r xmlns=\"urn:t\"><a>y</a></r>", "an or chain of 200,000 operands, the last one true")
+        invalid(chain, "<r xmlns=\"urn:t\"><a>z</a></r>", "assertion", "/r", "an or chain of 200,000 operands, none true")
+        val conjunction = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"a\" type=\"xs:string\" minOccurs=\"0\"/></xs:sequence><xs:assert test=\"${"t:a != 'x' and ".repeat(200000)}t:a != 'y'\"/></xs:complexType></xs:element>")
+        valid(conjunction, "<r xmlns=\"urn:t\"><a>z</a></r>", "an and chain of 200,000 operands, all true")
+        invalid(conjunction, "<r xmlns=\"urn:t\"><a>y</a></r>", "assertion", "/r", "an and chain of 200,000 operands, the last one false")
+        val mixed = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"a\" type=\"xs:string\" minOccurs=\"0\"/></xs:sequence><xs:assert test=\"t:a = 'p' or t:a = 'q' and t:a = 'q' or t:a = 'r'\"/></xs:complexType></xs:element>")
+        valid(mixed, "<r xmlns=\"urn:t\"><a>r</a></r>", "or and and keep their precedence in a chain (r)")
+        valid(mixed, "<r xmlns=\"urn:t\"><a>q</a></r>", "or and and keep their precedence in a chain (q)")
+        invalid(mixed, "<r xmlns=\"urn:t\"><a>s</a></r>", "assertion", "/r", "or and and keep their precedence in a chain (s)")
     }
     testsPassed()
 }

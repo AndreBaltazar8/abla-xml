@@ -557,6 +557,44 @@ private fun xsdSortedUnique(values: array<int>): array<int> {
     out
 }
 
+// An or / and chain, a or b or c ..., is a tree that leans to the left: walking it with a stack of its own (the operands in order, the leftmost first, each one only when the
+// ones before it did not decide) keeps a chain of any length off the call stack. The answer and the order of evaluation are those of the nested form.
+private fun xsdChainLeft(expression: XsdExpr, isOr: bool): XsdExpr? = when (expression) {
+    is XsdExprOr -> if (isOr) expression.left else null
+    is XsdExprAnd -> if (!isOr) expression.left else null
+    else -> null
+}
+
+private fun xsdChainRight(expression: XsdExpr, isOr: bool): XsdExpr? = when (expression) {
+    is XsdExprOr -> if (isOr) expression.right else null
+    is XsdExprAnd -> if (!isOr) expression.right else null
+    else -> null
+}
+
+private fun xsdEvaluateChain(var tree: XsdTree, context: int, start: XsdExpr, isOr: bool): XsdSequence {
+    val rights: array<XsdExpr> = []
+    var node = start
+    while (true) {
+        val left = xsdChainLeft(node, isOr)
+        val right = xsdChainRight(node, isOr)
+        if (left == null || right == null) break
+        rights.append(right)
+        node = left
+    }
+    var index = rights.size
+    var current = node
+    while (true) {
+        val operand = xsdEffectiveBoolean(xsdEvaluate(tree, context, current))
+        if (operand.error != "") return xsdErrorSequence(operand.error)
+        if (isOr && operand.value) return xsdBooleanSequence(true)
+        if (!isOr && !operand.value) return xsdBooleanSequence(false)
+        if (index == 0) break
+        index = index - 1
+        current = rights[index]
+    }
+    xsdBooleanSequence(!isOr)
+}
+
 fun xsdEvaluate(var tree: XsdTree, context: int, expression: XsdExpr): XsdSequence = when (expression) {
     is XsdExprLiteral -> XsdSequence([], [XsdAtom(expression.primitive, expression.text)], "")
     is XsdExprPath -> xsdEvaluatePath(tree, context, expression.steps)
@@ -566,24 +604,8 @@ fun xsdEvaluate(var tree: XsdTree, context: int, expression: XsdExpr): XsdSequen
         else if (condition.value) xsdEvaluate(tree, context, expression.then)
         else xsdEvaluate(tree, context, expression.otherwise)
     }
-    is XsdExprOr -> {
-        val left = xsdEffectiveBoolean(xsdEvaluate(tree, context, expression.left))
-        if (left.error != "") xsdErrorSequence(left.error)
-        else if (left.value) xsdBooleanSequence(true)
-        else {
-            val right = xsdEffectiveBoolean(xsdEvaluate(tree, context, expression.right))
-            if (right.error != "") xsdErrorSequence(right.error) else xsdBooleanSequence(right.value)
-        }
-    }
-    is XsdExprAnd -> {
-        val left = xsdEffectiveBoolean(xsdEvaluate(tree, context, expression.left))
-        if (left.error != "") xsdErrorSequence(left.error)
-        else if (!left.value) xsdBooleanSequence(false)
-        else {
-            val right = xsdEffectiveBoolean(xsdEvaluate(tree, context, expression.right))
-            if (right.error != "") xsdErrorSequence(right.error) else xsdBooleanSequence(right.value)
-        }
-    }
+    is XsdExprOr -> xsdEvaluateChain(tree, context, expression, true)
+    is XsdExprAnd -> xsdEvaluateChain(tree, context, expression, false)
     is XsdExprCompare -> xsdEvaluateCompare(tree, context, expression)
     is XsdExprCall -> xsdEvaluateCall(tree, context, expression)
 }
