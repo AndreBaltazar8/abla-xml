@@ -1,0 +1,278 @@
+// What an untrusted XSD schema, and an untrusted instance validated against a trusted one, can make the validator do (#1139 area 4):
+//
+//   xsd-security chain N          N simple types, each a restriction of the one before
+//   xsd-security nest N           an element declaration N anonymous types deep (the schema document is N * 3 levels deep; its maxDepth is raised to allow it)
+//   xsd-security groups N         N complex types, each holding an element of the type before (a chain of references)
+//   xsd-security cycle KIND       a cycle of simple-base, complex-base, group, attribute-group, substitution or element-ref: refused, not followed for ever
+//   xsd-security particles        nested sequences with minOccurs and maxOccurs of 1000 each: the size of the content model
+//   xsd-security include          xs:include, xs:import, xs:redefine and xs:override naming a file and a URL: refused (a schema is one document), and an instance's xsi:schemaLocation is not followed
+//   xsd-security value KIND N     an instance value of N characters for integer, decimal, double, list, base64, hex, pattern and length facets
+//   xsd-security xpath KIND N     an assertion that is N parentheses deep, N terms of `or`, N steps of a path, N nested not(): how the XPath parser and evaluator take it
+//   xsd-security assert KIND N    the cost of assertions over an instance: KIND miss (N strings against N strings, none equal), missint (the same with integers: the work budget), compare, wide, chain
+//   xsd-security identity N       xs:key and xs:keyref over N items, then the same with every value equal
+// Each prints what happened and how long it took, and "xsd-security MODE ok" when nothing failed in a way that is a defect (a crash, a hang, a result that is wrong).
+import "../src/xml.ab"
+import "../src/xsd/entry.ab"
+import "abla/bytes"
+import "abla/io"
+import "abla/integer"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/text"
+
+var failures = 0
+
+fun fail(message: string): void {
+    failures = failures + 1
+    println("FAIL $message")
+    return
+}
+
+val head = "<xs:schema xmlns:xs=\"http://www.w3.org/2001/XMLSchema\" xmlns:t=\"urn:t\" targetNamespace=\"urn:t\" elementFormDefault=\"qualified\">"
+
+fun schemaOf(body: string): string = "$head$body</xs:schema>"
+
+fun elapsed(since: int): string = "${realtimeMilliseconds() - since} ms"
+
+/** Loads a schema and prints how it went. */
+fun load(label: string, source: string, options: XmlOptions = XmlOptions()): XsdSchemaResult {
+    val started = realtimeMilliseconds()
+    val result = xsdLoad(source, options)
+    println("$label: schema ${if (result.succeeded) "loaded" else "refused (${result.error.slice(0, if (result.error.size > 100) 100 else result.error.size)})"} in ${elapsed(started)}")
+    return result
+}
+
+fun validate(label: string, schema: XsdSchema, document: string, options: XsdOptions = XsdOptions()): XsdValidation {
+    val started = realtimeMilliseconds()
+    val result = xsdValidate(schema, document, options)
+    val first = if (result.errors.size > 0) "${result.errors[0].code}: ${result.errors[0].message}" else ""
+    println("$label: instance ${if (result.valid) "valid" else "invalid (${result.errorCount} errors, first [${first.slice(0, if (first.size > 80) 80 else first.size)}])"}, ${result.elements} elements, in ${elapsed(started)}")
+    return result
+}
+
+fun deepOptions(depth: int): XmlOptions = XmlOptions(maxDepth = depth, maxNodes = depth * 8 + 1000, maxBytes = 1073741824)
+
+fun runChain(count: int): void {
+    val body = byteBuffer()
+    body.appendText("<xs:simpleType name=\"t0\"><xs:restriction base=\"xs:string\"><xs:maxLength value=\"1000\"/></xs:restriction></xs:simpleType>")
+    for (i in 1 until count) body.appendText("<xs:simpleType name=\"t$i\"><xs:restriction base=\"t:t${i - 1}\"/></xs:simpleType>")
+    body.appendText("<xs:element name=\"r\" type=\"t:t${count - 1}\"/>")
+    val result = load("chain $count", schemaOf(body.toText()), XmlOptions(maxDepth = 8, maxNodes = count * 20 + 1000, maxBytes = 1073741824))
+    val schema = result.schema
+    if (schema != null) validate("chain $count", schema, "<t:r xmlns:t=\"urn:t\">abc</t:r>")
+    return
+}
+
+fun runNest(depth: int): void {
+    val open = byteBuffer()
+    val close = byteBuffer()
+    for (i in 0 until depth) {
+        open.appendText("<xs:element name=\"e\"><xs:complexType><xs:sequence minOccurs=\"0\">")
+        close.appendText("</xs:sequence></xs:complexType></xs:element>")
+    }
+    val result = load("nest $depth", schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence minOccurs=\"0\">${open.toText()}${close.toText()}</xs:sequence></xs:complexType></xs:element>"), deepOptions(depth * 3 + 20))
+    val schema = result.schema
+    if (schema != null) validate("nest $depth", schema, "<t:r xmlns:t=\"urn:t\"/>")
+    return
+}
+
+fun runGroups(count: int): void {
+    // N complex types, each holding an element that is of the type before (a chain of references through named types).
+    val body = byteBuffer()
+    body.appendText("<xs:element name=\"e0\" type=\"xs:string\"/>")
+    for (i in 1 until count) body.appendText("<xs:complexType name=\"t$i\"><xs:sequence><xs:element ref=\"t:e${i - 1}\" minOccurs=\"0\"/></xs:sequence></xs:complexType><xs:element name=\"e$i\" type=\"t:t$i\"/>")
+    val result = load("typechain $count", schemaOf(body.toText()), XmlOptions(maxDepth = 8, maxNodes = count * 40 + 1000, maxBytes = 1073741824))
+    val schema = result.schema
+    if (schema != null) validate("typechain $count", schema, "<t:e${count - 1} xmlns:t=\"urn:t\"/>")
+    return
+}
+
+fun runCycle(kind: string): void {
+    var body = ""
+    if (kind == "simple-base") body = "<xs:simpleType name=\"a\"><xs:restriction base=\"t:b\"/></xs:simpleType><xs:simpleType name=\"b\"><xs:restriction base=\"t:a\"/></xs:simpleType><xs:element name=\"r\" type=\"t:a\"/>"
+    else if (kind == "complex-base") body = "<xs:complexType name=\"a\"><xs:complexContent><xs:extension base=\"t:b\"/></xs:complexContent></xs:complexType><xs:complexType name=\"b\"><xs:complexContent><xs:extension base=\"t:a\"/></xs:complexContent></xs:complexType><xs:element name=\"r\" type=\"t:a\"/>"
+    else if (kind == "group") body = "<xs:group name=\"a\"><xs:sequence><xs:group ref=\"t:b\"/></xs:sequence></xs:group><xs:group name=\"b\"><xs:sequence><xs:group ref=\"t:a\"/></xs:sequence></xs:group><xs:element name=\"r\"><xs:complexType><xs:group ref=\"t:a\"/></xs:complexType></xs:element>"
+    else if (kind == "attribute-group") body = "<xs:attributeGroup name=\"a\"><xs:attributeGroup ref=\"t:b\"/></xs:attributeGroup><xs:attributeGroup name=\"b\"><xs:attributeGroup ref=\"t:a\"/></xs:attributeGroup><xs:element name=\"r\"><xs:complexType><xs:attributeGroup ref=\"t:a\"/></xs:complexType></xs:element>"
+    else if (kind == "substitution") body = "<xs:element name=\"a\" substitutionGroup=\"t:b\" type=\"xs:string\"/><xs:element name=\"b\" substitutionGroup=\"t:a\" type=\"xs:string\"/><xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element ref=\"t:a\"/></xs:sequence></xs:complexType></xs:element>"
+    else if (kind == "element-ref") body = "<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element ref=\"t:r\" minOccurs=\"0\"/></xs:sequence></xs:complexType></xs:element>"
+    else if (kind == "self-type") body = "<xs:complexType name=\"n\"><xs:sequence><xs:element name=\"c\" type=\"t:n\" minOccurs=\"0\"/></xs:sequence></xs:complexType><xs:element name=\"r\" type=\"t:n\"/>"
+    val result = load("cycle $kind", schemaOf(body), XmlOptions())
+    val schema = result.schema
+    // The last two are legal recursion and load; the others are cycles and must be refused.
+    val legal = kind == "element-ref" || kind == "self-type"
+    if (legal != result.succeeded) fail("cycle $kind: the schema ${if (result.succeeded) "loaded" else "was refused"}, expected the opposite")
+    if (schema != null) validate("cycle $kind", schema, "<t:r xmlns:t=\"urn:t\"><t:${if (kind == "self-type") "c" else "r"}/></t:r>")
+    return
+}
+
+fun runParticles(): void {
+    val limits = "minOccurs=\"1000\" maxOccurs=\"1000\""
+    val body = "<xs:element name=\"r\"><xs:complexType><xs:sequence $limits><xs:sequence $limits><xs:sequence $limits><xs:sequence $limits><xs:element name=\"a\" type=\"xs:string\" minOccurs=\"0\" maxOccurs=\"1000\"/></xs:sequence></xs:sequence></xs:sequence></xs:sequence></xs:complexType></xs:element>"
+    val result = load("particles", schemaOf(body))
+    val schema = result.schema
+    if (schema != null) validate("particles", schema, "<t:r xmlns:t=\"urn:t\"/>")
+    val wide = "<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"a\" type=\"xs:string\" minOccurs=\"0\" maxOccurs=\"100000000\"/><xs:element name=\"b\" type=\"xs:string\" minOccurs=\"0\" maxOccurs=\"100000000\"/></xs:sequence></xs:complexType></xs:element>"
+    val second = load("particles (counts of 100,000,000)", schemaOf(wide))
+    val other = second.schema
+    if (other != null) validate("particles (counts of 100,000,000)", other, "<t:r xmlns:t=\"urn:t\"><t:a/><t:b/></t:r>")
+    return
+}
+
+fun runInclude(): void {
+    val kinds: array<string> = ["include", "import", "redefine", "override"]
+    for (kind in kinds) {
+        for (location in ["file:///etc/passwd", "/etc/passwd", "http://127.0.0.1:1/x.xsd", "../../../../etc/passwd"]) {
+            val body = "<xs:$kind schemaLocation=\"$location\"${if (kind == "import") " namespace=\"urn:other\"" else ""}/><xs:element name=\"r\" type=\"xs:string\"/>"
+            val result = load("$kind $location", schemaOf(body))
+            if (result.succeeded) fail("xs:$kind with a schemaLocation was accepted")
+            else if (!result.error.contains("unsupported")) fail("xs:$kind was refused for another reason: ${result.error}")
+        }
+    }
+    // A schema document with a DTD (entities, an external subset) is refused by the parser's default.
+    val dtd = "<!DOCTYPE xs:schema SYSTEM \"file:///etc/passwd\">" + schemaOf("<xs:element name=\"r\" type=\"xs:string\"/>")
+    val refused = load("a schema with a DOCTYPE", dtd)
+    if (refused.succeeded) fail("a schema with a DOCTYPE was loaded with the default options")
+    // An instance's own schema hints are not followed: it is validated against the schema given, whatever it says.
+    val ok = load("the schema", schemaOf("<xs:element name=\"r\" type=\"xs:string\"/>"))
+    val schema = ok.schema
+    if (schema != null) {
+        val hinted = validate("xsi:schemaLocation to a file", schema,
+            "<t:r xmlns:t=\"urn:t\" xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\" xsi:schemaLocation=\"urn:t file:///etc/passwd\" xsi:noNamespaceSchemaLocation=\"http://127.0.0.1:1/x.xsd\">x</t:r>")
+        if (!hinted.valid) println("note: the schema hints made the instance invalid: ${hinted.errors[0].message}")
+    }
+    return
+}
+
+fun digits(count: int): string = "7".repeat(count)
+
+fun runValue(kind: string, size: int): void {
+    var typeBody = ""
+    var value = ""
+    if (kind == "integer") { typeBody = "<xs:restriction base=\"xs:integer\"><xs:maxInclusive value=\"${digits(size)}\"/><xs:minInclusive value=\"-${digits(size)}\"/></xs:restriction>"; value = digits(size) }
+    else if (kind == "decimal") { typeBody = "<xs:restriction base=\"xs:decimal\"><xs:totalDigits value=\"${size}\"/><xs:maxInclusive value=\"${digits(size)}.5\"/></xs:restriction>"; value = digits(size / 2) + "." + digits(size / 2) }
+    else if (kind == "double") { typeBody = "<xs:restriction base=\"xs:double\"/>"; value = "0." + digits(size) + "E5" }
+    else if (kind == "list") { typeBody = "<xs:list itemType=\"xs:int\"/>"; value = "1 ".repeat(size) }
+    else if (kind == "base64") { typeBody = "<xs:restriction base=\"xs:base64Binary\"><xs:maxLength value=\"${size}\"/></xs:restriction>"; value = "QUJD".repeat(size / 4) }
+    else if (kind == "hex") { typeBody = "<xs:restriction base=\"xs:hexBinary\"/>"; value = "AB".repeat(size / 2) }
+    else if (kind == "pattern") { typeBody = "<xs:restriction base=\"xs:string\"><xs:pattern value=\"(a|aa)+b\"/></xs:restriction>"; value = "a".repeat(size) }
+    else if (kind == "pattern2") { typeBody = "<xs:restriction base=\"xs:string\"><xs:pattern value=\"([a-z]+)*[0-9]\"/></xs:restriction>"; value = "a".repeat(size) }
+    else if (kind == "enumeration") {
+        val values = byteBuffer()
+        for (i in 0 until 20000) values.appendText("<xs:enumeration value=\"v$i\"/>")
+        typeBody = "<xs:restriction base=\"xs:string\">${values.toText()}</xs:restriction>"
+        value = "v19999"
+    }
+    else if (kind == "datetime") { typeBody = "<xs:restriction base=\"xs:dateTime\"/>"; value = "2026-11-23T10:00:00." + digits(size) + "Z" }
+    else if (kind == "duration") { typeBody = "<xs:restriction base=\"xs:duration\"/>"; value = "P" + digits(size) + "Y" }
+    else if (kind == "anyuri") { typeBody = "<xs:restriction base=\"xs:anyURI\"/>"; value = "http://x/" + "a".repeat(size) }
+    else if (kind == "qname") { typeBody = "<xs:restriction base=\"xs:QName\"/>"; value = "t:" + "a".repeat(size) }
+    else { fail("unknown value kind $kind"); return }
+    val result = load("value $kind $size", schemaOf("<xs:simpleType name=\"v\">$typeBody</xs:simpleType><xs:element name=\"r\" type=\"t:v\"/>"), XmlOptions())
+    val schema = result.schema
+    if (schema != null) validate("value $kind $size", schema, "<t:r xmlns:t=\"urn:t\">$value</t:r>", XsdOptions(xml = XmlOptions(maxValueBytes = 67108864)))
+    return
+}
+
+fun xpathBody(kind: string, size: int): string {
+    if (kind == "parens") return "(".repeat(size) + "1" + ")".repeat(size) + " = 1"
+    if (kind == "or") return "t:a or ".repeat(size) + "true()"
+    if (kind == "and") return "t:a and ".repeat(size) + "true()"
+    if (kind == "path") return "t:a/".repeat(size) + "t:a"
+    if (kind == "not") return "not(".repeat(size) + "true()" + ")".repeat(size)
+    if (kind == "if") return "if (true()) then ".repeat(size) + "true() " + "else false() ".repeat(size)
+    if (kind == "predicates") return "t:a" + "[1]".repeat(size)
+    "true()"
+}
+
+fun runXpath(kind: string, size: int): void {
+    val test = xpathBody(kind, size)
+    val body = "<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"a\" type=\"xs:string\" minOccurs=\"0\"/></xs:sequence><xs:assert test=\"$test\"/></xs:complexType></xs:element>"
+    val result = load("xpath $kind $size", schemaOf(body), XmlOptions(maxValueBytes = 67108864))
+    val schema = result.schema
+    if (schema != null) validate("xpath $kind $size", schema, "<t:r xmlns:t=\"urn:t\"><t:a>x</t:a></t:r>")
+    return
+}
+
+fun runAssert(kind: string, size: int): void {
+    if (kind == "chain") {
+        // A recursive type with an assertion that looks at all of the element's subtree, at every level of a chain: N levels of N elements each, N * N / 2 nodes read.
+        val body = "<xs:complexType name=\"n\"><xs:sequence><xs:element name=\"c\" type=\"t:n\" minOccurs=\"0\"/></xs:sequence><xs:assert test=\"count(.//t:c) ge 0\"/></xs:complexType><xs:element name=\"r\" type=\"t:n\"/>"
+        val result = load("assert chain $size", schemaOf(body))
+        val schema = result.schema
+        if (schema != null) {
+            val options = XsdOptions(xml = deepOptions(size + 10))
+            validate("assert chain $size", schema, "<t:r xmlns:t=\"urn:t\">${"<t:c>".repeat(size)}${"</t:c>".repeat(size)}</t:r>", options)
+        }
+    } else if (kind == "wide") {
+        val body = "<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"c\" type=\"xs:string\" minOccurs=\"0\" maxOccurs=\"unbounded\"/></xs:sequence><xs:assert test=\"count(t:c) ge 0 and t:c[last()] = t:c[last()]\"/></xs:complexType></xs:element>"
+        val result = load("assert wide $size", schemaOf(body))
+        val schema = result.schema
+        if (schema != null) validate("assert wide $size", schema, "<t:r xmlns:t=\"urn:t\">${"<t:c>x</t:c>".repeat(size)}</t:r>", XsdOptions(xml = XmlOptions(maxDepth = 10, maxNodes = size * 4 + 100, maxBytes = 1073741824)))
+    } else if (kind == "miss" || kind == "missint") {
+        // A general comparison of two sequences with no pair that matches reads every pair: N children against N children is N * N comparisons, except for strings, which a set answers
+        // in linear time; integers go by pair, under the budget of XsdOptions.maxAssertionWork.
+        val operator = "="
+        val type = if (kind == "miss") "xs:string" else "xs:integer"
+        val body = "<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"c\" type=\"$type\" minOccurs=\"0\" maxOccurs=\"unbounded\"/><xs:element name=\"d\" type=\"$type\" minOccurs=\"0\" maxOccurs=\"unbounded\"/></xs:sequence><xs:assert test=\"not(t:c $operator t:d)\"/></xs:complexType></xs:element>"
+        val result = load("assert $kind $size", schemaOf(body))
+        val schema = result.schema
+        if (schema != null) {
+            val items = byteBuffer()
+            items.appendText("<t:r xmlns:t=\"urn:t\">")
+            for (i in 0 until size) items.appendText("<t:c>${if (kind == "miss") "c$i" else "$i"}</t:c>")
+            for (i in 0 until size) items.appendText("<t:d>${if (kind == "miss") "d$i" else "${i + 10000000}"}</t:d>")
+            items.appendText("</t:r>")
+            validate("assert $kind $size", schema, items.toText(), XsdOptions(xml = XmlOptions(maxDepth = 10, maxNodes = size * 8 + 100, maxBytes = 1073741824)))
+        }
+    } else if (kind == "compare") {
+        // A general comparison of two big sequences is quadratic: N children compared with N children.
+        val body = "<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"c\" type=\"xs:string\" minOccurs=\"0\" maxOccurs=\"unbounded\"/></xs:sequence><xs:assert test=\"t:c = t:c\"/></xs:complexType></xs:element>"
+        val result = load("assert compare $size", schemaOf(body))
+        val schema = result.schema
+        if (schema != null) validate("assert compare $size", schema, "<t:r xmlns:t=\"urn:t\">${"<t:c>x</t:c>".repeat(size)}</t:r>", XsdOptions(xml = XmlOptions(maxDepth = 10, maxNodes = size * 4 + 100, maxBytes = 1073741824)))
+    }
+    return
+}
+
+fun runIdentity(size: int, same: bool): void {
+    val body = "<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"item\" minOccurs=\"0\" maxOccurs=\"unbounded\"><xs:complexType><xs:attribute name=\"id\" type=\"xs:string\"/><xs:attribute name=\"ref\" type=\"xs:string\"/></xs:complexType></xs:element></xs:sequence></xs:complexType>" +
+        "<xs:key name=\"k\"><xs:selector xpath=\"t:item\"/><xs:field xpath=\"@id\"/></xs:key><xs:keyref name=\"kr\" refer=\"t:k\"><xs:selector xpath=\"t:item\"/><xs:field xpath=\"@ref\"/></xs:keyref></xs:element>"
+    val result = load("identity $size", schemaOf(body))
+    val schema = result.schema
+    if (schema == null) return
+    val items = byteBuffer()
+    items.appendText("<t:r xmlns:t=\"urn:t\">")
+    for (i in 0 until size) items.appendText("<t:item id=\"${if (same) "same" else "k$i"}\" ref=\"${if (same) "same" else "k$i"}\"/>")
+    items.appendText("</t:r>")
+    val options = XsdOptions(xml = XmlOptions(maxDepth = 10, maxNodes = size * 4 + 100, maxBytes = 1073741824))
+    val validation = validate("identity $size ${if (same) "(all equal)" else ""}", schema, items.toText(), options)
+    if (!same && !validation.valid) fail("identity $size: distinct keys were not valid")
+    if (same && validation.valid) fail("identity $size: equal keys were valid")
+    return
+}
+
+fun main: int {
+    if (processArgumentCount() < 1) {
+        println("usage: xsd-security chain|nest|groups N | cycle KIND | particles | include | value KIND N | xpath KIND N | assert KIND N | identity N [same]")
+        return 2
+    }
+    val mode = processArgument(0)
+    val a = if (processArgumentCount() > 1) processArgument(1) else ""
+    val b = if (processArgumentCount() > 2) processArgument(2) else ""
+    if (mode == "chain") runChain(a.parseInt() ?? 100)
+    else if (mode == "nest") runNest(a.parseInt() ?? 100)
+    else if (mode == "groups") runGroups(a.parseInt() ?? 100)
+    else if (mode == "cycle") runCycle(a)
+    else if (mode == "particles") runParticles()
+    else if (mode == "include") runInclude()
+    else if (mode == "value") runValue(a, b.parseInt() ?? 1000)
+    else if (mode == "xpath") runXpath(a, b.parseInt() ?? 100)
+    else if (mode == "assert") runAssert(a, b.parseInt() ?? 100)
+    else if (mode == "identity") runIdentity(a.parseInt() ?? 1000, b == "same")
+    else {
+        println("unknown mode $mode")
+        return 2
+    }
+    if (failures == 0) println("xsd-security $mode ok")
+    if (failures == 0) 0 else 1
+}

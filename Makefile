@@ -49,7 +49,7 @@ fuzz:
 	$(BUILD_DIR)/fuzz $(FUZZ_ITERATIONS) $(FUZZ_SEED) $(BUILD_DIR)/fuzz-seeds.txt
 
 # Security checks that are not fuzzing (tools/security.ab): every limit at its boundary, the entity limits, the XSD regex's cost, the writer's escaping through the parser,
-# the decoders against Unicode's tables, and deep trees. Takes under a minute.
+# the decoders against Unicode's tables, and deep trees; and (tools/xsd-security.ab) what an untrusted schema or instance can make the XSD validator do. Takes under a minute.
 security:
 	mkdir -p $(BUILD_DIR)
 	$(COMPILER) build tools/security.ab -o $(BUILD_DIR)/security
@@ -61,6 +61,20 @@ security:
 	$(BUILD_DIR)/security writer 20000 1
 	$(BUILD_DIR)/security depth 20000 text
 	$(BUILD_DIR)/security depth 1000000 write
+	$(COMPILER) build tools/xsd-security.ab -o $(BUILD_DIR)/xsd-security
+	for kind in simple-base complex-base group attribute-group substitution element-ref self-type; do $(BUILD_DIR)/xsd-security cycle $$kind || exit 1; done
+	$(BUILD_DIR)/xsd-security include
+	$(BUILD_DIR)/xsd-security particles
+	$(BUILD_DIR)/xsd-security chain 10000
+	$(BUILD_DIR)/xsd-security nest 1000
+	$(BUILD_DIR)/xsd-security xpath parens 100000
+	$(BUILD_DIR)/xsd-security xpath not 100000
+	$(BUILD_DIR)/xsd-security xpath if 100000
+	$(BUILD_DIR)/xsd-security xpath or 100000
+	$(BUILD_DIR)/xsd-security xpath and 100000
+	$(BUILD_DIR)/xsd-security assert miss 30000
+	$(BUILD_DIR)/xsd-security assert missint 5000
+	$(BUILD_DIR)/xsd-security identity 100000
 
 # Prints where this parser and xmllint disagree on fuzz inputs. Not pass or fail.
 differential:

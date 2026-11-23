@@ -2,10 +2,14 @@
 
 ## Unreleased
 
+- Assertions: `=` and `!=` over strings and untyped values compare in linear time (a set of one side's texts), an expression
+  nests at most 128 levels (`xsdXpathMaxDepth`: 10,000 open parentheses, `not(` or `if` in a schema ended the process with a
+  stack overflow), and an `or` / `and` chain is evaluated with a stack of its own (a chain of 10,000 operands overflowed).
+- `tools/xsd-security.ab`: what an untrusted schema or instance can make the validator do (cycles, includes, content-model
+  size, type chains, value parsing, XPath depth and length, assertion and identity-constraint cost), in `make security`.
 - `XsdOptions.maxAssertionWork` (25,000,000): the pairs of values the general comparisons of assertions compare, in all of a
   document. `not(c = d)` over N and N values that never match cost N * N (30,000 each: 63 s for a 1 MB document); past the
   limit the assertions that need a comparison fail with that reason.
-
 - `xmlWriteElement` no longer recurses per level: a tree a million levels deep (a reader with `maxDepth` raised) is written
   without a stack overflow (it overflowed from about 20,000 levels).
 - `tools/security.ab` and `make security`: every `XmlOptions` limit checked at its boundary, the entity limits, the XSD
