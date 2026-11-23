@@ -1,0 +1,517 @@
+// Security checks of the parser, the writer and the XSD regex that are not mutation fuzzing (tools/fuzz.ab does that), #1139 area 4:
+//
+//   security limits              every limit of XmlOptions: a document exactly at it is taken, one past it is refused with its code (a test of the package, in this harness
+//                                so it can use big documents), and what the entity limits allow of a billion-laughs and a quadratic-blowup document, with the time it took
+//   security depth N STEP        (STEP text or write) a document N elements deep with maxDepth raised to N + 1: parsed, written back, its text read; prints how each step ended (a deep tree
+//                                makes the recursive tree functions the limit, not the reader)
+//   security regex               the XSD regex: patterns whose cost depends on the compiler (nested counted repeats), and the match time of patterns that backtrack in other engines
+//   security writer COUNT SEED   the writer's escaping: random text, attribute values, comments, CDATA, processing instructions (every character class that matters to markup) are written
+//                                and parsed again: the tree must have the shape that was written, each value must read back the same, and what the writer refuses it must refuse
+//                                as an error, not write
+//   security utf8 SAMPLES SEED   every 1-, 2- and 3-byte (lead 0xE0-0xEF) sequence and a sample of 4-byte ones as text, attribute value and comment, against Unicode's table of well formed sequences
+//   security utf16 / cp1252      every UTF-16 code unit (both orders, with a mark), surrogate pairs, every windows-1252 byte
+// Each mode prints one line per check and "security MODE ok" last, or FAIL lines and a status of 1.
+import "../src/xml.ab"
+import "../src/parse.ab"
+import "../src/writer.ab"
+import "../src/tree.ab"
+import "../src/reader.ab"
+import "../src/chars.ab"
+import "../src/xsd/regex.ab"
+import "abla/bytes"
+import "abla/io"
+import "abla/integer"
+import "abla/process/arguments"
+import "abla/process/time"
+import "abla/text"
+import "abla/crypto"
+
+var failures = 0
+
+fun fail(message: string): void {
+    failures = failures + 1
+    println("FAIL $message")
+    return
+}
+
+fun check(ok: bool, message: string): void {
+    if (!ok) fail(message)
+    return
+}
+
+fun codeOf(source: string, options: XmlOptions): string {
+    val result = xmlParse(source, options)
+    val problem = result.error
+    if (result.succeeded) "" else if (problem != null) problem.code else "?"
+}
+
+/** A document is taken at a limit and refused with `code` one past it. */
+fun boundary(what: string, atLimit: string, pastLimit: string, code: string, options: XmlOptions): void {
+    val first = codeOf(atLimit, options)
+    val second = codeOf(pastLimit, options)
+    check(first == "", "$what: a document at the limit gave [$first]")
+    check(second == code, "$what: a document past the limit gave [$second], not [$code]")
+    println("limit $what: at the limit [$first], one past [$second]")
+    return
+}
+
+fun nested(depth: int): string = "<a>".repeat(depth) + "</a>".repeat(depth)
+
+fun runLimits(): void {
+    val defaults = XmlOptions()
+    boundary("maxDepth ${defaults.maxDepth}", nested(defaults.maxDepth), nested(defaults.maxDepth + 1), "too_deep", defaults)
+    boundary("maxDepth 5", nested(5), nested(6), "too_deep", XmlOptions(maxDepth = 5))
+    var attributes = "<a"
+    var pastAttributes = "<a"
+    for (i in 0 until defaults.maxAttributes) attributes = attributes + " a$i='x'"
+    pastAttributes = attributes + " z='x'"
+    boundary("maxAttributes ${defaults.maxAttributes}", attributes + "/>", pastAttributes + "/>", "too_many_attributes", defaults)
+    boundary("maxNameBytes ${defaults.maxNameBytes}", "<${"n".repeat(defaults.maxNameBytes)}/>", "<${"n".repeat(defaults.maxNameBytes + 1)}/>", "name_too_long", defaults)
+    val spaceOptions = XmlOptions(maxNamespaces = 10)
+    var spaces = "<a"
+    for (i in 0 until 10) spaces = spaces + " xmlns:p$i='u$i'"
+    boundary("maxNamespaces 10", spaces + "/>", spaces + " xmlns:z='z'/>", "too_many_namespaces", spaceOptions)
+    val value = XmlOptions(maxValueBytes = 1000)
+    boundary("maxValueBytes text", "<a>${"x".repeat(1000)}</a>", "<a>${"x".repeat(1001)}</a>", "value_too_long", value)
+    boundary("maxValueBytes attribute", "<a b='${"x".repeat(1000)}'/>", "<a b='${"x".repeat(1001)}'/>", "value_too_long", value)
+    boundary("maxValueBytes comment", "<a><!--${"x".repeat(1000)}--></a>", "<a><!--${"x".repeat(1001)}--></a>", "value_too_long", value)
+    boundary("maxValueBytes instruction", "<a><?p ${"x".repeat(1000)}?></a>", "<a><?p ${"x".repeat(1001)}?></a>", "value_too_long", value)
+    boundary("maxValueBytes CDATA", "<a><![CDATA[${"x".repeat(1000)}]]></a>", "<a><![CDATA[${"x".repeat(1001)}]]></a>", "value_too_long", value)
+    val source = "<a>${"x".repeat(90)}</a>"
+    boundary("maxBytes ${source.size}", source, source + " ", "too_large", XmlOptions(maxBytes = source.size))
+    // Entities: the three limits, exactly.
+    val entities = XmlOptions(allowDtd = true)
+    val expansions = "<!DOCTYPE a [<!ENTITY e 'x'>]><a>${"&e;".repeat(entities.maxEntityExpansions)}</a>"
+    boundary("maxEntityExpansions ${entities.maxEntityExpansions}", expansions, expansions.replace("</a>", "&e;</a>"), "entity_limit", entities)
+    val bytes = XmlOptions(allowDtd = true, maxEntityBytes = 1000)
+    boundary("maxEntityBytes 1000", "<!DOCTYPE a [<!ENTITY e '${"x".repeat(100)}'>]><a>${"&e;".repeat(10)}</a>",
+        "<!DOCTYPE a [<!ENTITY e '${"x".repeat(100)}'>]><a>${"&e;".repeat(11)}</a>", "entity_limit", bytes)
+    // Nesting of references: e0 holds text, each next one holds the one before.
+    val chain = byteBuffer()
+    chain.appendText("<!DOCTYPE a [<!ENTITY e0 'x'>")
+    for (i in 1 until 40) chain.appendText("<!ENTITY e$i '&e${i - 1};'>")
+    chain.appendText("]><a>")
+    val head = chain.toText()
+    val limit = entities.maxEntityDepth
+    boundary("maxEntityDepth $limit", head + "&e${limit - 1};</a>", head + "&e${limit + 1};</a>", "entity_limit", entities)
+    // The DOCTYPE is refused by default, whatever it holds.
+    check(codeOf("<!DOCTYPE a SYSTEM 'file:///etc/passwd'><a/>", defaults) == "dtd_forbidden", "a DOCTYPE with an external subset is refused by default")
+    check(codeOf("<!DOCTYPE a [<!ENTITY e SYSTEM 'file:///etc/passwd'>]><a>&e;</a>", defaults) == "dtd_forbidden", "an external entity is refused by default")
+    // With the DTD allowed, an external entity is skipped, not read, and its text is nowhere in the result.
+    val external = xmlParse("<!DOCTYPE a [<!ENTITY e SYSTEM 'file:///etc/passwd'>]><a>x&e;y</a>", entities)
+    val document = external.document
+    check(external.succeeded && document != null && document.root.text() == "xy", "an external entity is skipped and nothing is read")
+    // The billion laughs and a quadratic blowup under the default entity limits: refused quickly.
+    val laughs = byteBuffer()
+    laughs.appendText("<!DOCTYPE a [<!ENTITY l0 'hahahahaha'>")
+    for (i in 1 until 12) {
+        laughs.appendText("<!ENTITY l$i '")
+        for (j in 0 until 10) laughs.appendText("&l${i - 1};")
+        laughs.appendText("'>")
+    }
+    laughs.appendText("]><a>&l11;</a>")
+    val started = realtimeMilliseconds()
+    val laughsCode = codeOf(laughs.toText(), entities)
+    val laughsTime = realtimeMilliseconds() - started
+    check(laughsCode == "entity_limit", "the billion laughs gave [$laughsCode]")
+    check(laughsTime < 1000, "the billion laughs took $laughsTime ms")
+    println("limit billion laughs: [$laughsCode] in $laughsTime ms")
+    val quadratic = "<!DOCTYPE a [<!ENTITY e '${"x".repeat(100000)}'>]><a>${"&e;".repeat(100)}</a>"
+    val quadraticStart = realtimeMilliseconds()
+    val quadraticCode = codeOf(quadratic, entities)
+    println("limit quadratic blowup (100 x 100000 bytes): [$quadraticCode] in ${realtimeMilliseconds() - quadraticStart} ms")
+    check(quadraticCode == "entity_limit", "100 references to a 100000-byte entity gave [$quadraticCode]")
+    return
+}
+
+
+/** The smallest value of `limit` (as XmlOptions built by `make`) at which `source` is taken, found by bisection; -1 when it is never taken within `high`. */
+fun smallestAccepted(source: string, make: (int) -> XmlOptions, high: int): int {
+    if (codeOf(source, make(high)) != "") return -1
+    var low = 0
+    var top = high
+    while (low < top) {
+        val middle = (low + top) / 2
+        if (codeOf(source, make(middle)) == "") top = middle else low = middle + 1
+    }
+    low
+}
+
+fun nodesOptions(limit: int): XmlOptions = XmlOptions(maxNodes = limit)
+
+/** The number of events of a document is its smallest maxNodes, so a document at it is taken and one below it is refused. */
+fun runNodes(): void {
+    val source = "<a>${"<b/>".repeat(3)}x</a>"
+    val smallest = smallestAccepted(source, nodesOptions, 1000)
+    check(smallest > 0, "no maxNodes takes the document")
+    check(codeOf(source, XmlOptions(maxNodes = smallest)) == "", "maxNodes $smallest takes it")
+    check(codeOf(source, XmlOptions(maxNodes = smallest - 1)) == "too_many_nodes", "maxNodes ${smallest - 1} refuses it")
+    println("limit maxNodes: the document needs $smallest (elements ${1 + 3}, text runs 1, plus the document's end)")
+    return
+}
+
+/** A document `depth` elements deep with maxDepth raised: how each step ends (the reader is iterative; the tree functions are the ones that can overflow the stack). */
+fun runDepth(depth: int, step: string): void {
+    val options = XmlOptions(maxDepth = depth + 1, maxNodes = depth * 4 + 16)
+    val source = nested(depth)
+    val started = realtimeMilliseconds()
+    val result = xmlParse(source, options)
+    println("depth $depth: parse ${if (result.succeeded) "ok" else "refused"} in ${realtimeMilliseconds() - started} ms")
+    val document = result.document
+    if (document == null) {
+        val problem = result.error
+        println("depth $depth: error ${if (problem != null) problem.code else "?"}")
+        return
+    }
+    if (step == "text") {
+    val textStart = realtimeMilliseconds()
+    val text = document.root.text()
+    println("depth $depth: text() ${text.size} bytes in ${realtimeMilliseconds() - textStart} ms")
+    return
+    }
+    val writeStart = realtimeMilliseconds()
+    var writer = xmlWriter()
+    xmlWriteDocument(writer, document)
+    val written = writer.finish()
+    println("depth $depth: write ${if (written.succeeded) "ok ${written.text.size} bytes" else "refused ${written.errorCode}"} in ${realtimeMilliseconds() - writeStart} ms")
+    val back = xmlParse(written.text, options)
+    println("depth $depth: parse of the written document ${if (back.succeeded) "ok" else "refused"}")
+    return
+}
+
+/** Time of the XSD regex: compilation of patterns with nested counted repeats, and matching of patterns that backtrack in other engines. */
+fun runRegex(): void {
+    val patterns: array<string> = ["((a{1000}){1000}){1000}", "(a{100000}){100000}", "(((((a{10}){10}){10}){10}){10}){10}", "(a|aa)+b", "(a*)*b", "(a+)+\$", "([a-z]+)*[0-9]", "(a?){2000}a{2000}", "[\\p{L}\\p{N}]+", "(x+x+)+y"]
+    for (pattern in patterns) {
+        val started = realtimeMilliseconds()
+        val regex = xsdRegexCompile(pattern)
+        val compiled = realtimeMilliseconds() - started
+        if (regex.error != "") {
+            println("regex [$pattern]: refused in $compiled ms: ${regex.error}")
+            check(compiled < 2000, "[$pattern] took $compiled ms to be refused")
+            continue
+        }
+        var detail = ""
+        for (size in [1000, 100000]) {
+            val text = "a".repeat(size)
+            val matchStart = realtimeMilliseconds()
+            val matched = regex.matches(text)
+            val elapsed = realtimeMilliseconds() - matchStart
+            detail = detail + " $size bytes: ${if (matched) "match" else "no match"} in $elapsed ms;"
+            check(elapsed < 20000, "[$pattern] on $size bytes took $elapsed ms")
+        }
+        println("regex [$pattern]: ${regex.ops.size} instructions, compiled in $compiled ms,$detail")
+        check(compiled < 2000, "[$pattern] took $compiled ms to compile")
+    }
+    return
+}
+
+var randomState = 1
+
+fun nextRandom(bound: int): int {
+    randomState = (randomState * 6364136223846793005 + 1442695040888963407) & 9223372036854775807
+    ((randomState >> 33) & 2147483647) % bound
+}
+
+val markupPieces: array<string> = ["&", "<", ">", "\"", "'", "]]>", "]]", "]", "-", "--", "?>", "?", "!", "<!--", "-->", "<![CDATA[", "]]><b/><![CDATA[", "</r>", "<b/>", "&amp;", "&#60;", "\r", "\n", "\r\n", "\t", " ", "  ", "é", "€", "\u{1F600}", "\u{FFFD}", "\u{7F}", "\u{80}", "\u{85}", "\u{2028}", "x", "xmlns", "\u{D7FF}", "\u{E000}", "\u{10FFFF}"]
+val invalidPieces: array<string> = ["\x01", "\x08", "\x0B", "\x1F", "\u{FFFE}", "\u{FFFF}", "\xC0\x80", "\xED\xA0\x80", "\xF4\x90\x80\x80", "\xFF", "\x80"]
+
+fun randomValue(): string {
+    val out = byteBuffer()
+    val pieces = nextRandom(12)
+    for (i in 0 until pieces) {
+        if (nextRandom(40) == 0) out.appendText(invalidPieces[nextRandom(invalidPieces.size)])
+        else out.appendText(markupPieces[nextRandom(markupPieces.size)])
+    }
+    out.toText()
+}
+
+fun lineEnds(value: string): string = value.replace("\r\n", "\n").replace("\r", "\n")
+
+fun kindOf(node: XmlNode): string = when (node) {
+    is XmlElement -> "element"
+    is XmlText -> "text"
+    is XmlComment -> "comment"
+    is XmlProcessingInstruction -> "instruction"
+    else -> "other"
+}
+
+fun commentText(node: XmlNode): string = when (node) {
+    is XmlComment -> node.text
+    else -> ""
+}
+
+/** The children of `root` that are not the whitespace an indenting writer puts between nodes. */
+fun significantChildren(root: XmlElement): array<XmlNode> {
+    val out: array<XmlNode> = []
+    for (child in root.children) {
+        var blank = false
+        if (kindOf(child) == "text") {
+            val text = nodeText(child)
+            blank = true
+            for (b in text) if (b != 32 && b != 10 && b != 9 && b != 13) blank = false
+        }
+        if (!blank) out.append(child)
+    }
+    out
+}
+
+fun nodeText(node: XmlNode): string = when (node) {
+    is XmlText -> node.text
+    else -> ""
+}
+
+fun elementChildren(root: XmlElement): int {
+    var n = 0
+    for (child in root.children) if (kindOf(child) == "element") n = n + 1
+    n
+}
+
+/** Writes one piece of random content in a root element and parses the result: the writer either refuses the piece or the root holds exactly the piece, read back as written. */
+fun runWriter(count: int, seed: int): void {
+    randomState = seed
+    val encodings: array<string> = ["UTF-8", "US-ASCII", "ISO-8859-1", "windows-1252"]
+    var accepted = 0
+    var refused = 0
+    var injected = 0
+    for (i in 0 until count) {
+        val kind = nextRandom(5)
+        val value = randomValue()
+        val encoding = encodings[nextRandom(encodings.size)]
+        val indent = if (nextRandom(4) == 0) "  " else ""
+        var writer = xmlWriter(XmlWriterOptions(encoding = encoding, indent = indent))
+        writer.declaration()
+        writer.startElement("r")
+        if (kind == 0) writer.text(value)
+        else if (kind == 1) writer.attribute("a", value)
+        else if (kind == 2) writer.comment(value)
+        else if (kind == 3) writer.cdata(value)
+        else writer.processingInstruction("p", value)
+        writer.endElement()
+        val written = writer.finish()
+        if (!written.succeeded) {
+            refused = refused + 1
+            continue
+        }
+        accepted = accepted + 1
+        val result = xmlParse(written.text)
+        val problem = result.error
+        val document = result.document
+        if (!result.succeeded || document == null) {
+            fail("case $i kind $kind $encoding: the writer's output did not parse (${if (problem != null) problem.code else "?"}): [$value] -> [${written.text}]")
+            continue
+        }
+        val root = document.root
+        check(document.prolog.size == 0 && document.epilog.size == 0, "case $i kind $kind: content outside the root: [$value] -> [${written.text}]")
+        if (elementChildren(root) != 0 || root.name != "r") {
+            injected = injected + 1
+            fail("case $i kind $kind $encoding: markup got out of the value: [$value] -> [${written.text}]")
+        }
+        if (kind == 0 || kind == 3) {
+            check(root.text() == value, "case $i kind $kind $encoding: the text read back as [${root.text()}], not [$value]")
+        } else if (kind == 1) {
+            check(root.attributes.size == 1 && root.attributes[0].value == value, "case $i attribute $encoding: read back wrong: [$value] -> [${written.text}]")
+        } else if (kind == 2) {
+            val kids = significantChildren(root)
+            check(kids.size == 1 && kindOf(kids[0]) == "comment", "case $i comment: not one comment: [$value] -> [${written.text}]")
+            check(kids.size == 1 && commentText(kids[0]) == lineEnds(value), "case $i comment read back as [${if (kids.size > 0) commentText(kids[0]) else ""}], not [${lineEnds(value)}]")
+        } else {
+            check(significantChildren(root).size == 1 && kindOf(significantChildren(root)[0]) == "instruction", "case $i instruction: not one instruction: [$value] -> [${written.text}]")
+        }
+    }
+    println("writer: $count cases, $accepted written and read back, $refused refused by the writer, $injected with markup out of a value")
+    return
+}
+
+/** Whether `bytes` is one well formed UTF-8 sequence (Unicode's table of well formed sequences, Table 3-7), and the code point it holds, or -1. */
+fun referenceCodePoint(bytes: array<int>): int {
+    val n = bytes.size
+    if (n == 0) return -1
+    val b0 = bytes[0]
+    if (b0 < 128) return if (n == 1) b0 else -1
+    if (b0 >= 194 && b0 <= 223) return if (n == 2 && bytes[1] >= 128 && bytes[1] <= 191) ((b0 & 31) << 6) | (bytes[1] & 63) else -1
+    if (b0 >= 224 && b0 <= 239) {
+        if (n != 3) return -1
+        var low = 128
+        var high = 191
+        if (b0 == 224) low = 160
+        if (b0 == 237) high = 159
+        if (bytes[1] < low || bytes[1] > high || bytes[2] < 128 || bytes[2] > 191) return -1
+        return ((b0 & 15) << 12) | ((bytes[1] & 63) << 6) | (bytes[2] & 63)
+    }
+    if (b0 >= 240 && b0 <= 244) {
+        if (n != 4) return -1
+        var low = 128
+        var high = 191
+        if (b0 == 240) low = 144
+        if (b0 == 244) high = 143
+        if (bytes[1] < low || bytes[1] > high || bytes[2] < 128 || bytes[2] > 191 || bytes[3] < 128 || bytes[3] > 191) return -1
+        return ((b0 & 7) << 18) | ((bytes[1] & 63) << 12) | ((bytes[2] & 63) << 6) | (bytes[3] & 63)
+    }
+    -1
+}
+
+fun isXmlChar(cp: int): bool = cp == 9 || cp == 10 || cp == 13 || (cp >= 32 && cp <= 55295) || (cp >= 57344 && cp <= 65533) || (cp >= 65536 && cp <= 1114111)
+
+/** The verdict for a byte sequence: 1 when it is well formed UTF-8 (Unicode's table, character by character) of XML characters only, 0 when it is not, -1 when it holds a character that changes
+ *  the document (markup, a carriage return, a hyphen in a comment), which is not compared. */
+fun verdict(bytes: array<int>): int {
+    var i = 0
+    var changes = false
+    while (i < bytes.size) {
+        val b = bytes[i]
+        var length = 0
+        if (b < 128) length = 1
+        else if (b >= 194 && b <= 223) length = 2
+        else if (b >= 224 && b <= 239) length = 3
+        else if (b >= 240 && b <= 244) length = 4
+        if (length == 0 || i + length > bytes.size) return 0
+        val part: array<int> = []
+        for (k in 0 until length) part.append(bytes[i + k])
+        val cp = referenceCodePoint(part)
+        if (cp < 0 || !isXmlChar(cp)) return 0
+        if (cp == 13 || cp == 60 || cp == 38 || cp == 62 || cp == 34 || cp == 39 || cp == 45 || cp == 93) changes = true
+        i = i + length
+    }
+    if (changes) -1 else 1
+}
+
+/** One byte sequence as the content of an element, of an attribute value and of a comment: each taken exactly when it is well formed UTF-8 of XML characters. */
+fun checkSequence(bytes: array<int>): void {
+    val text = cryptoText(bytes)
+    val wanted = verdict(bytes)
+    if (wanted < 0) return
+    val taken = wanted == 1
+    check((codeOf("<a>$text</a>", XmlOptions()) == "") == taken, "the bytes [${hexOf(bytes)}] as text: ${if (taken) "refused" else "taken"}")
+    check((codeOf("<a b='$text'/>", XmlOptions()) == "") == taken, "the bytes [${hexOf(bytes)}] in an attribute value: ${if (taken) "refused" else "taken"}")
+    check((codeOf("<a><!--$text--></a>", XmlOptions()) == "") == taken, "the bytes [${hexOf(bytes)}] in a comment: ${if (taken) "refused" else "taken"}")
+    return
+}
+
+fun hexOf(bytes: array<int>): string {
+    var out = ""
+    for (b in bytes) out = out + (if (b < 16) "0" else "") + xmlHex(b)
+    out
+}
+
+fun cryptoText(bytes: array<int>): string {
+    val out = byteBuffer()
+    for (b in bytes) out.appendByteValue(b)
+    out.toText()
+}
+
+/** UTF-8: every one-byte and two-byte sequence, every three-byte sequence with a lead byte of 0xE0 to 0xEF, and `samples` four-byte ones, against Unicode's table. */
+fun runUtf8(samples: int, seed: int): void {
+    randomState = seed
+    var checked = 0
+    for (a in 0 until 256) {
+        checkSequence([a])
+        checked = checked + 1
+        for (b in 0 until 256) {
+            checkSequence([a, b])
+            checked = checked + 1
+        }
+    }
+    for (a in 224 until 240) for (b in 0 until 256) for (c in 0 until 256) {
+        checkSequence([a, b, c])
+        checked = checked + 1
+    }
+    for (i in 0 until samples) {
+        // Lead bytes around the edges, continuation bytes biased to the edges of their ranges.
+        val lead = 238 + nextRandom(10)
+        val edges: array<int> = [0, 127, 128, 143, 144, 159, 160, 191, 192, 255]
+        checkSequence([lead, edges[nextRandom(edges.size)], if (nextRandom(2) == 0) 128 + nextRandom(64) else edges[nextRandom(edges.size)], if (nextRandom(2) == 0) 128 + nextRandom(64) else edges[nextRandom(edges.size)]])
+        checked = checked + 1
+    }
+    println("utf8: $checked sequences, each as text, as an attribute value and in a comment")
+    return
+}
+
+/** UTF-16: every code unit alone (little and big endian, with and without a byte order mark), every surrogate pair of the wrong order or half, and a sample of well formed pairs. */
+fun utf16Bytes(units: array<int>, bigEndian: bool, mark: bool): string {
+    val out = byteBuffer()
+    if (mark) {
+        if (bigEndian) { out.appendByteValue(254); out.appendByteValue(255) } else { out.appendByteValue(255); out.appendByteValue(254) }
+    }
+    val text = "<a>"
+    for (c in text) { if (bigEndian) { out.appendByteValue(0); out.appendByteValue(c) } else { out.appendByteValue(c); out.appendByteValue(0) } }
+    for (u in units) {
+        if (bigEndian) { out.appendByteValue(u >> 8); out.appendByteValue(u & 255) } else { out.appendByteValue(u & 255); out.appendByteValue(u >> 8) }
+    }
+    for (c in "</a>") { if (bigEndian) { out.appendByteValue(0); out.appendByteValue(c) } else { out.appendByteValue(c); out.appendByteValue(0) } }
+    out.toText()
+}
+
+fun runUtf16(): void {
+    var checked = 0
+    for (u in 0 until 65536) {
+        val surrogate = u >= 55296 && u <= 57343
+        val expected = !surrogate && isXmlChar(u) && u != 60 && u != 38 && u != 13
+        for (big in [false, true]) {
+            val code = codeOf(utf16Bytes([u], big, true), XmlOptions())
+            checked = checked + 1
+            if (u == 60 || u == 38 || u == 13) continue
+            check((code == "") == expected, "UTF-16 ${if (big) "BE" else "LE"} unit ${xmlHex(u)}: ${if (code == "") "taken" else "refused ($code)"}, expected ${if (expected) "taken" else "refused"}")
+        }
+    }
+    // Pairs: a high surrogate and a low one make a character; every other combination of two surrogates, and a surrogate beside a plain unit, is refused.
+    for (high in [55295, 55296, 56319, 56320, 57343, 57344]) for (low in [55295, 55296, 56319, 56320, 57343, 57344]) {
+        val pair = high >= 55296 && high <= 56319 && low >= 56320 && low <= 57343
+        val code = codeOf(utf16Bytes([high, low], false, true), XmlOptions())
+        checked = checked + 1
+        val bothPlain = !(high >= 55296 && high <= 57343) && !(low >= 55296 && low <= 57343)
+        check((code == "") == (pair || bothPlain), "UTF-16 pair ${xmlHex(high)} ${xmlHex(low)}: ${if (code == "") "taken" else "refused ($code)"}")
+    }
+    // A unit with no byte order mark is read as UTF-8 and refused; a mark that disagrees with the declaration is refused.
+    check(codeOf("\xFF\xFE<\x00?\x00x\x00m\x00l\x00 \x00v\x00e\x00r\x00s\x00i\x00o\x00n\x00=\x00'\x001\x00.\x000\x00'\x00 \x00e\x00n\x00c\x00o\x00d\x00i\x00n\x00g\x00=\x00'\x00U\x00T\x00F\x00-\x008\x00'\x00?\x00>\x00<\x00a\x00/\x00>\x00", XmlOptions()) != "", "a UTF-16 byte order mark with an encoding declaration of UTF-8 was taken")
+    println("utf16: $checked cases")
+    return
+}
+
+/** windows-1252: every byte as text; 0x81, 0x8D, 0x8F, 0x90 and 0x9D have no character and are refused; the rest map to the characters of the table. */
+fun runCp1252(): void {
+    var taken = 0
+    for (b in 0 until 256) {
+        val source = "<?xml version='1.0' encoding='windows-1252'?><a>" + cryptoText([b]) + "</a>"
+        val code = codeOf(source, XmlOptions())
+        val hole = b == 129 || b == 141 || b == 143 || b == 144 || b == 157
+        val control = b < 32 && b != 9 && b != 10 && b != 13
+        val markup = b == 60 || b == 38 || b == 13
+        if (markup) continue
+        // 0x7F is an XML character (U+007F is allowed in XML 1.0), so only the holes and the controls below 0x20 are refused.
+        val reallyExpected = !hole && !control
+        check((code == "") == reallyExpected, "windows-1252 byte ${xmlHex(b)}: ${if (code == "") "taken" else "refused ($code)"}, expected ${if (reallyExpected) "taken" else "refused"}")
+        if (code == "") taken = taken + 1
+    }
+    println("windows-1252: $taken of 256 bytes taken")
+    return
+}
+
+fun main: int {
+    if (processArgumentCount() < 1) {
+        println("usage: security limits | depth N | regex | writer COUNT SEED")
+        return 2
+    }
+    val mode = processArgument(0)
+    if (mode == "limits") {
+        runLimits()
+        runNodes()
+    } else if (mode == "depth") {
+        runDepth(processArgument(1).parseInt() ?? 1000, if (processArgumentCount() > 2) processArgument(2) else "text")
+    } else if (mode == "utf8") {
+        runUtf8(processArgument(1).parseInt() ?? 100000, processArgument(2).parseInt() ?? 1)
+    } else if (mode == "utf16") {
+        runUtf16()
+    } else if (mode == "cp1252") {
+        runCp1252()
+    } else if (mode == "regex") {
+        runRegex()
+    } else if (mode == "writer") {
+        runWriter(processArgument(1).parseInt() ?? 1000, processArgument(2).parseInt() ?? 1)
+    } else {
+        println("unknown mode $mode")
+        return 2
+    }
+    if (failures == 0) println("security $mode ok")
+    if (failures == 0) 0 else 1
+}

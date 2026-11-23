@@ -7,7 +7,7 @@ CORPUS_DIR ?= $(BUILD_DIR)/corpus
 FUZZ_ITERATIONS ?= 200000
 FUZZ_SEED ?= 1
 
-.PHONY: test unit conformance written fuzz differential wildcard-oracle big all clean
+.PHONY: test unit conformance written fuzz security differential wildcard-oracle big all clean
 
 all: unit conformance written fuzz
 
@@ -47,6 +47,20 @@ fuzz:
 	bash tools/fetch-conformance.sh $(SUITE_DIR)
 	find $(SUITE_DIR)/xmlconf -name '*.xml' -size -16k > $(BUILD_DIR)/fuzz-seeds.txt
 	$(BUILD_DIR)/fuzz $(FUZZ_ITERATIONS) $(FUZZ_SEED) $(BUILD_DIR)/fuzz-seeds.txt
+
+# Security checks that are not fuzzing (tools/security.ab): every limit at its boundary, the entity limits, the XSD regex's cost, the writer's escaping through the parser,
+# the decoders against Unicode's tables, and deep trees. Takes under a minute.
+security:
+	mkdir -p $(BUILD_DIR)
+	$(COMPILER) build tools/security.ab -o $(BUILD_DIR)/security
+	$(BUILD_DIR)/security limits
+	$(BUILD_DIR)/security regex
+	$(BUILD_DIR)/security cp1252
+	$(BUILD_DIR)/security utf16
+	$(BUILD_DIR)/security utf8 200000 1
+	$(BUILD_DIR)/security writer 20000 1
+	$(BUILD_DIR)/security depth 20000 text
+	$(BUILD_DIR)/security depth 1000000 write
 
 # Prints where this parser and xmllint disagree on fuzz inputs. Not pass or fail.
 differential:

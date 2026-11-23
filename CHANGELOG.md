@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `xmlWriteElement` no longer recurses per level: a tree a million levels deep (a reader with `maxDepth` raised) is written
+  without a stack overflow (it overflowed from about 20,000 levels).
+- `tools/security.ab` and `make security`: every `XmlOptions` limit checked at its boundary, the entity limits, the XSD
+  regex's cost, the writer's escaping through the parser (400,000 random values), and the decoders against Unicode's
+  tables (every 1- to 3-byte UTF-8 sequence, every UTF-16 unit, every windows-1252 byte).
+
 ## 0.3.0
 
 - Add XML Schema validation, `import github("AndreBaltazar8/abla-xml/xsd")`: `xsdLoad`, `xsdValidate`,
