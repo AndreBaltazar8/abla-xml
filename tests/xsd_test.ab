@@ -306,6 +306,15 @@ fun main: int {
         invalid(differs, "<r xmlns=\"urn:t\"><c>a</c><c>a</c><d>a</d><d>a</d></r>", "assertion", "/r", "equal on both sides: != does not hold")
         valid(differs, "<r xmlns=\"urn:t\"><c>a</c><c>b</c><d>a</d></r>", "a, b != a holds (b differs)")
         invalid(differs, "<r xmlns=\"urn:t\"><c>a</c></r>", "assertion", "/r", "an empty side: != is false")
+        // An assertion's expression nests at most xsdXpathMaxDepth (128) levels: its parser and its evaluator recurse on the nesting, and a schema with ten thousand open
+        // parentheses ended the process with a stack overflow.
+        expect(xsdLoad("$head<xs:element name=\"r\"><xs:complexType><xs:sequence/><xs:assert test=\"${"(".repeat(127)}true()${")".repeat(127)}\"/></xs:complexType></xs:element></xs:schema>").succeeded, "an expression 127 parentheses deep loads")
+        val nested = xsdLoad("$head<xs:element name=\"r\"><xs:complexType><xs:sequence/><xs:assert test=\"${"(".repeat(200)}true()${")".repeat(200)}\"/></xs:complexType></xs:element></xs:schema>")
+        expect(!nested.succeeded && nested.error.contains("nests deeper"), "an expression 200 parentheses deep is refused: ${nested.error}")
+        val notted = xsdLoad("$head<xs:element name=\"r\"><xs:complexType><xs:sequence/><xs:assert test=\"${"not(".repeat(20000)}true()${")".repeat(20000)}\"/></xs:complexType></xs:element></xs:schema>")
+        expect(!notted.succeeded && notted.error.contains("nests deeper"), "20,000 nested not() are refused, not a stack overflow: ${notted.error}")
+        val iffed = xsdLoad("$head<xs:element name=\"r\"><xs:complexType><xs:sequence/><xs:assert test=\"${"if (true()) then ".repeat(20000)}true()${" else false()".repeat(20000)}\"/></xs:complexType></xs:element></xs:schema>")
+        expect(!iffed.succeeded && iffed.error.contains("nests deeper"), "20,000 nested if-then-else are refused: ${iffed.error}")
     }
     testsPassed()
 }
