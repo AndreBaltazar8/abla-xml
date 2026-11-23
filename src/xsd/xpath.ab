@@ -587,6 +587,27 @@ private fun xsdEvaluateCompare(var tree: XsdTree, context: int, expression: XsdE
         if (order.error != "") return xsdErrorSequence(order.error)
         return xsdBooleanSequence(xsdHolds(expression.op, order.order))
     }
+    // `=` and `!=` between values that are all strings or untyped compare their text: a set of one side's texts answers it in linear time, the same answer as the pairs.
+    if (expression.op == CMP_EQ || expression.op == CMP_NE) {
+        var textual = true
+        for (a in left.atoms) if (a.primitive != xsdPrimitiveUntyped && !xsdPrimitiveIsStringLike(a.primitive)) textual = false
+        for (b in right.atoms) if (b.primitive != xsdPrimitiveUntyped && !xsdPrimitiveIsStringLike(b.primitive)) textual = false
+        if (textual) {
+            tree.work = tree.work + left.atoms.size + right.atoms.size
+            if (tree.work > tree.workLimit) return xsdErrorSequence("assertions compared more than ${tree.workLimit} pairs of values in this document (maxAssertionWork)")
+            if (left.atoms.size == 0 || right.atoms.size == 0) return xsdBooleanSequence(false)
+            if (expression.op == CMP_EQ) {
+                val seen: Map<string, bool> = Map()
+                for (b in right.atoms) seen.set(b.text, true)
+                for (a in left.atoms) if (seen.has(a.text)) return xsdBooleanSequence(true)
+                return xsdBooleanSequence(false)
+            }
+            val first = left.atoms[0].text
+            for (a in left.atoms) if (a.text != first) return xsdBooleanSequence(true)
+            for (b in right.atoms) if (b.text != first) return xsdBooleanSequence(true)
+            return xsdBooleanSequence(false)
+        }
+    }
     for (a in left.atoms) {
         for (b in right.atoms) {
             tree.work = tree.work + 1
