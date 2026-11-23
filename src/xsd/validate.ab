@@ -22,7 +22,10 @@ class XsdOptions(
     // Values identity constraints hold at once, over the document.
     val maxIdentityEntries: int = 16777216,
     // Elements in the tree of one element with assertions.
-    val maxAssertionNodes: int = 1048576
+    val maxAssertionNodes: int = 1048576,
+    // Pairs of values the general comparisons of assertions (`a = b` over two sequences) may compare, in all of a document: each pair is compared until one holds, so two
+    // sequences of N and M values that never match cost N * M. Past it every assertion that still needs a comparison fails, with this limit as its reason.
+    val maxAssertionWork: int = 25000000
 )
 
 // One way the document breaks the schema. `code` is content, value, attribute, assertion,
@@ -803,7 +806,7 @@ class XsdRun(
     }
 }
 
-fun xsdRun(options: XsdOptions): XsdRun = XsdRun(options, [], 0, [], [], 0, [], [], XsdTree([], -1, 0), Map())
+fun xsdRun(options: XsdOptions): XsdRun = XsdRun(options, [], 0, [], [], 0, [], [], XsdTree([], -1, 0, 0, options.maxAssertionWork), Map())
 
 // Validates the events of `reader` against the schema.
 fun xsdValidateReader(schema: XsdSchema, var reader: XmlReader, options: XsdOptions = XsdOptions()): XsdValidation {

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- `XsdOptions.maxAssertionWork` (25,000,000): the pairs of values the general comparisons of assertions compare, in all of a
+  document. `not(c = d)` over N and N values that never match cost N * N (30,000 each: 63 s for a 1 MB document); past the
+  limit the assertions that need a comparison fail with that reason.
+
 - `xmlWriteElement` no longer recurses per level: a tree a million levels deep (a reader with `maxDepth` raised) is written
   without a stack overflow (it overflowed from about 20,000 levels).
 - `tools/security.ab` and `make security`: every `XmlOptions` limit checked at its boundary, the entity limits, the XSD

@@ -277,6 +277,19 @@ fun main: int {
         // A long value against a pattern takes linear time.
         val pattern = schemaOf("<xs:element name=\"r\"><xs:simpleType><xs:restriction base=\"xs:string\"><xs:pattern value=\"(a|aa)*(a|aa)*c\"/></xs:restriction></xs:simpleType></xs:element>")
         invalid(pattern, "<r xmlns=\"urn:t\">${"a".repeat(200000)}b</r>", "value", "/r", "a long value that doesn't match")
+        // A general comparison compares pair after pair until one holds: two sequences that never match cost the product of their lengths, which a document can make
+        // as large as it likes. maxAssertionWork bounds it for the whole document; past it the assertion fails with that reason.
+        val numbers = schemaOf("<xs:element name=\"r\"><xs:complexType><xs:sequence><xs:element name=\"c\" type=\"xs:integer\" minOccurs=\"0\" maxOccurs=\"unbounded\"/><xs:element name=\"d\" type=\"xs:integer\" minOccurs=\"0\" maxOccurs=\"unbounded\"/></xs:sequence><xs:assert test=\"not(t:c = t:d)\"/></xs:complexType></xs:element>")
+        if (numbers != null) {
+            val misses = byteBuffer()
+            misses.appendText("<r xmlns=\"urn:t\">")
+            for (n in 0 until 2000) misses.appendText("<c>$n</c>")
+            for (n in 0 until 2000) misses.appendText("<d>${n + 100000}</d>")
+            misses.appendText("</r>")
+            val spent = xsdValidate(numbers, misses.toText(), XsdOptions(maxAssertionWork = 1000000))
+            expect(!spent.valid && spent.errors[0].code == "assertion" && spent.errors[0].message.contains("maxAssertionWork"), "a comparison of 2,000 by 2,000 misses passes a work limit of 1,000,000: ${firstError(spent)}")
+            expect(xsdValidate(numbers, misses.toText(), XsdOptions(maxAssertionWork = 5000000)).valid, "and is valid within a limit of 5,000,000 (4,000,000 comparisons)")
+        }
     }
     testsPassed()
 }

@@ -288,7 +288,10 @@ bounded, and so are size, depth and nodes. The validator holds the open elements
 of an element with assertions while it is open (`maxAssertionNodes`, 1,048,576), and the values
 of identity constraints (`maxIdentityEntries`, 16,777,216, over the document); past either it
 stops with a `limit` error. A keyref value found before its key is kept until the end of the
-constraint's element. A schema's patterns compile to at most 65,536 instructions and its content
+constraint's element. A general comparison in an assertion (`a = b` over two sequences) compares pairs until one holds, so
+two sequences that never match cost the product of their lengths: all the comparisons of a document are counted
+against `maxAssertionWork` (25,000,000), and past it the assertions that need one fail with that as the reason.
+A schema's patterns compile to at most 65,536 instructions and its content
 models to at most 1,048,576 states.
 
 On the development machine it validates a 126 MB SAF-T file in 7.4 s with a peak of 140 MB,

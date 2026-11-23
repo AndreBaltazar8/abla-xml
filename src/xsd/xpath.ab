@@ -31,7 +31,10 @@ class XsdNode(
 
 // `root` is the element an assertion belongs to: nothing is above it.
 // Its nodes are nodes[0 until size]; the others are kept to be used again.
-class XsdTree(val nodes: array<XsdNode>, var root: int = -1, var size: int = 0) {
+class XsdTree(val nodes: array<XsdNode>, var root: int = -1, var size: int = 0,
+    // Comparisons of values made by general comparisons in assertions so far in this document, and the most allowed (XsdOptions.maxAssertionWork): `a = b` over two
+    // sequences compares every pair until one holds, so a long run of misses costs the product of their lengths.
+    var work: int = 0, var workLimit: int = 25000000) {
     fun add(namespace: string, localName: string, parent: int, line: int, column: int): int {
         if (size == nodes.size) nodes.append(XsdNode("", "", -1, "", [], -1, 0, 0))
         val at = size
@@ -541,7 +544,7 @@ private fun xsdSortedUnique(values: array<int>): array<int> {
     out
 }
 
-fun xsdEvaluate(tree: XsdTree, context: int, expression: XsdExpr): XsdSequence = when (expression) {
+fun xsdEvaluate(var tree: XsdTree, context: int, expression: XsdExpr): XsdSequence = when (expression) {
     is XsdExprLiteral -> XsdSequence([], [XsdAtom(expression.primitive, expression.text)], "")
     is XsdExprPath -> xsdEvaluatePath(tree, context, expression.steps)
     is XsdExprIf -> {
@@ -572,7 +575,7 @@ fun xsdEvaluate(tree: XsdTree, context: int, expression: XsdExpr): XsdSequence =
     is XsdExprCall -> xsdEvaluateCall(tree, context, expression)
 }
 
-private fun xsdEvaluateCompare(tree: XsdTree, context: int, expression: XsdExprCompare): XsdSequence {
+private fun xsdEvaluateCompare(var tree: XsdTree, context: int, expression: XsdExprCompare): XsdSequence {
     val left = xsdAtomize(tree, xsdEvaluate(tree, context, expression.left))
     if (left.error != "") return xsdErrorSequence(left.error)
     val right = xsdAtomize(tree, xsdEvaluate(tree, context, expression.right))
@@ -586,6 +589,8 @@ private fun xsdEvaluateCompare(tree: XsdTree, context: int, expression: XsdExprC
     }
     for (a in left.atoms) {
         for (b in right.atoms) {
+            tree.work = tree.work + 1
+            if (tree.work > tree.workLimit) return xsdErrorSequence("assertions compared more than ${tree.workLimit} pairs of values in this document (maxAssertionWork)")
             val order = xsdCompareAtoms(a, b, true)
             if (order.error != "") return xsdErrorSequence(order.error)
             if (xsdHolds(expression.op, order.order)) return xsdBooleanSequence(true)
@@ -594,7 +599,7 @@ private fun xsdEvaluateCompare(tree: XsdTree, context: int, expression: XsdExprC
     xsdBooleanSequence(false)
 }
 
-private fun xsdEvaluateCall(tree: XsdTree, context: int, expression: XsdExprCall): XsdSequence {
+private fun xsdEvaluateCall(var tree: XsdTree, context: int, expression: XsdExprCall): XsdSequence {
     if (expression.name == "true") return xsdBooleanSequence(true)
     if (expression.name == "false") return xsdBooleanSequence(false)
     val argument = xsdEvaluate(tree, context, expression.arguments[0])
@@ -613,7 +618,7 @@ private fun xsdEvaluateCall(tree: XsdTree, context: int, expression: XsdExprCall
 
 // Whether an assertion holds on the tree's node `context`; the error that made it fail
 // when evaluation raised one.
-fun xsdAssertionHolds(tree: XsdTree, context: int, expression: XsdExpr): XsdBool =
+fun xsdAssertionHolds(var tree: XsdTree, context: int, expression: XsdExpr): XsdBool =
     xsdEffectiveBoolean(xsdEvaluate(tree, context, expression))
 
 // --- Identity constraint paths -----------------------------------------------------------
