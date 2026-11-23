@@ -2,6 +2,10 @@ import "../src/xml.ab"
 import "abla/test"
 import "../src/writer.ab"
 import "../src/chars.ab"
+import "../src/parse.ab"
+import "../src/reader.ab"
+import "../src/tree.ab"
+import "abla/text"
 
 fun fails(result: XmlWriteResult, code: string, label: string): void {
     expect(!result.succeeded, "$label fails")
@@ -210,5 +214,18 @@ fun main: int {
     undeclareDefault.endElement()
     undeclareDefault.endElement()
     expectEqual(undeclareDefault.finish().text, "<a xmlns=\"urn:d\"><b xmlns=\"\"/></a>", "default namespace can be undone")
+    // A tree as deep as a reader with its maxDepth raised can give: written with a stack of its own, not the call stack (this was a stack overflow from about 20,000 levels).
+    val depth = 200000
+    val deep = xmlParse("<a>".repeat(depth) + "<b>x</b>" + "</a>".repeat(depth), XmlOptions(maxDepth = depth + 2, maxNodes = depth * 4 + 16))
+    val deepDocument = deep.document
+    expect(deep.succeeded && deepDocument != null, "a document ${depth} levels deep parses with maxDepth raised")
+    if (deepDocument != null) {
+        val deepWriter = xmlWriter()
+        xmlWriteDocument(deepWriter, deepDocument)
+        val written = deepWriter.finish()
+        expect(written.succeeded, "a tree ${depth} levels deep is written: ${written.errorCode}")
+        expect(written.text.size > depth * 7, "the bytes of the deep tree")
+        expect(xmlParse(written.text, XmlOptions(maxDepth = depth + 2, maxNodes = depth * 4 + 16)).succeeded, "the deep tree reads back")
+    }
     testsPassed()
 }

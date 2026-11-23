@@ -43,8 +43,8 @@ fun xmlWriteResolvedNode(var writer: XmlWriter, node: XmlNode): void {
     return
 }
 
-// Writes an element and everything in it, in order.
-fun xmlWriteElement(var writer: XmlWriter, element: XmlElement): void {
+// Writes the start of an element: its tag, attributes and namespace declarations, and the checks of a resolved tree. The children come after, in xmlWriteElement.
+fun xmlWriteElementStart(var writer: XmlWriter, element: XmlElement): void {
     writer.startElement(element.name)
     for (attribute in element.attributes) {
         if (attribute.name == "xmlns") {
@@ -79,11 +79,40 @@ fun xmlWriteElement(var writer: XmlWriter, element: XmlElement): void {
             }
         }
     }
-    for (node in element.children) {
-        if (element.namespacesResolved) xmlWriteResolvedNode(writer, node)
-        else xmlWriteNode(writer, node)
+    return
+}
+
+// Writes an element and everything in it, in order. The tree is walked with a stack of its own, so how deep it is does not matter (a reader with its maxDepth raised
+// can give a tree a million levels deep): the call stack does not grow with it.
+fun xmlWriteElement(var writer: XmlWriter, element: XmlElement): void {
+    val open: array<XmlElement> = [element]
+    val next: array<int> = [0]
+    xmlWriteElementStart(writer, element)
+    while (open.size > 0) {
+        val top = open.size - 1
+        val current = open[top]
+        val at = next[top]
+        if (at >= current.children.size) {
+            writer.endElement()
+            open.truncate(top)
+            next.truncate(top)
+            continue
+        }
+        next[top] = at + 1
+        val node = current.children[at]
+        when (node) {
+            is XmlElement -> {
+                if (current.namespacesResolved && !node.namespacesResolved) {
+                    writer.fail("unresolved_namespace", "XML literal needs a namespace-aware node")
+                } else {
+                    xmlWriteElementStart(writer, node)
+                    open.append(node)
+                    next.append(0)
+                }
+            }
+            else -> xmlWriteNode(writer, node)
+        }
     }
-    writer.endElement()
     return
 }
 
